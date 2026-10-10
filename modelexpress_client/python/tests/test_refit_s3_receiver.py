@@ -1839,10 +1839,10 @@ def test_canonical_s3_applies_one_delta_to_the_active_checkpoint(
     apply_calls = 0
     checkpoint_copy_calls = 0
 
-    def track_apply(shards, *, index_metadata):
+    def track_apply(shards, *, index_metadata, verify=True):
         nonlocal apply_calls
         apply_calls += 1
-        apply_shards(shards, index_metadata=index_metadata)
+        apply_shards(shards, index_metadata=index_metadata, verify=verify)
 
     @contextmanager
     def track_replace(target, *, copy_from=None):
@@ -2196,7 +2196,7 @@ def test_canonical_s3_in_place_delta_failure_requires_recovery(
         )
     )
 
-    def fail_apply(_shards, *, index_metadata):
+    def fail_apply(_shards, *, index_metadata, verify=True):
         raise RuntimeError("injected delta failure")
 
     monkeypatch.setattr(adapter._checkpoint, "_apply_shards", fail_apply)

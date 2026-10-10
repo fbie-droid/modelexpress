@@ -593,6 +593,9 @@ engine integrations.
   fingerprints, and activation state.
 - `inference/receiver.py` owns canonical S3 downloads, safetensors validation,
   and XOR reconstruction into derived checkpoints.
+- `inference/prefetch.py` owns the optional per-cache background process that
+  prepares new versions before the update pauses the engine, including
+  speculative preparation of unregistered S3 deltas.
 - `inference/engines/vllm/installer.py` owns vLLM load-layout capture and
   graph-safe installation through vLLM's layerwise reload and post-load path.
 - `inference/engines/sglang/installer.py` reloads a prepared canonical checkpoint
@@ -1170,6 +1173,7 @@ RL framework integrations live in the separate `modelexpress_rl` package:
 | `inference/methods/` | Trainer load-time tensor, generator runtime tensor, and canonical-checkpoint preparation |
 | `inference/checkpoint_store.py` | Host-local immutable lineage, locking, temporary-directory promotion, atomic JSON persistence, artifact fingerprints, and activation state |
 | `inference/receiver.py` | Canonical S3 index/shard decoding, full-checkpoint validation, and XOR reconstruction into derived checkpoints |
+| `inference/prefetch.py` | Optional background preparation of new versions outside the serving pause, plus speculative S3 deltas adopted on registration |
 | `inference/load_strategy.py` | RL cold-start policy: exact desired-version P2P, canonical S3 replay, and version-agnostic fallback when no desired version is configured |
 | `inference/version_chain.py` | Shared validation and resolution of immutable full-checkpoint and delta lineage |
 | `inference/nixl_staged_transfer.py` | Private engine-neutral exact-manifest NIXL planning, transfer, reusable destination buffers, and verification |
@@ -1242,7 +1246,10 @@ update carries the opaque MX `version_id`.
 applies the version through `ModelExpressGeneratorClient`, and
 `finish_weight_update()` releases its staged handle. Each session accepts one
 version; calls before initialization, out-of-order calls, and a second update
-raise instead of reporting success. vLLM's reset hook releases staged resources
+raise instead of reporting success. Orchestrators may repeat
+`init_weight_transfer_engine()` before every update: a repeat for the same model
+returns at once and only asks the background prefetcher to poll, because vLLM
+runs it inside the engine loop. A repeat for another model raises. vLLM's reset hook releases staged resources
 and clears the session after an update error, including invalid payloads rejected
 before receiving weights. A failed finish retains the session so cleanup can be
 retried; already applied model weights are not rolled back. Draft-model updates remain

@@ -48,6 +48,11 @@ Environment variables used by the clients and vLLM engine:
 | `AWS_DEFAULT_REGION` | unset | S3 region when `region_name` is not supplied in client configuration. |
 | `MX_REFIT_DELTA_BUCKET_BYTES` | `536870912` (512 MiB) | Optional tensor-bucket size override for framework integrations. |
 | `MX_REFIT_DELTA_WORKERS` | `min(32, CPU count)` | CPU workers used to compute and apply XOR deltas. |
+| `MX_REFIT_PREFETCH` | `false` | Prepare new versions in a background process before the update pauses the engine. See [Background prefetch](#background-prefetch). |
+| `MX_REFIT_PREFETCH_S3_WATCH` | `false` | Also prepare deltas found in S3 before their versions are registered. Requires `MX_REFIT_PREFETCH`. |
+| `MX_REFIT_PREFETCH_POLL_SECONDS` | `2` | How often the prefetcher checks for new versions. |
+| `MX_REFIT_PREFETCH_WORKERS` | `min(8, CPU count)` | CPU workers the prefetcher uses to apply deltas while the engine serves. |
+| `MX_REFIT_PREFER_PREPARED` | `false` | Install a locally prepared target from object storage before trying a generator peer. |
 | `MX_REFIT_CHECKSUM_FORMAT` | `adler32` | Checksum algorithm written by canonical S3 trainers. |
 | `MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES` | `4294967296` (4 GiB) | Maximum tensor bytes grouped into one full-checkpoint safetensors object. |
 | `MX_S3_UPLOAD_WORKERS` | `8` | Maximum concurrent multipart uploads per trainer rank. |
@@ -605,3 +610,57 @@ checksums under tensor-name keys in shard metadata. They are retained as an
 immutable full artifact. XOR deltas require the complete index metadata contract
 above and are replayed in order in the canonical lineage; each preparation
 applies only the incoming delta to its exact active base.
+
+## Background prefetch
+
+An update normally downloads and reconstructs the target inside the engine's
+pause. With `MX_REFIT_PREFETCH=true`, one prefetcher process per host
+checkpoint cache does that work while the engine keeps serving. The update then
+finds the target prepared and only installs it.
+
+```mermaid
+sequenceDiagram
+    participant T as Trainer
+    participant S3 as Object storage
+    participant O as Orchestrator
+    participant MX as MX server
+    participant P as Prefetcher
+    participant E as Engine
+    T->>S3: upload delta
+    opt MX_REFIT_PREFETCH_S3_WATCH
+        P->>S3: find the delta whose base is the cache head
+        P->>P: download and reconstruct (speculative)
+    end
+    O->>MX: register the version
+    P->>MX: see the new READY version
+    P->>P: download and reconstruct, or adopt the speculative result
+    O->>E: pause, update, resume
+    Note over E: installs the prepared target
+```
+
+- The prefetcher watches the MX server for the newest READY version of the
+  model and prepares it into the same host-local cache, under the same locks,
+  as the engine's own update. An update that arrives while preparation runs
+  waits for it instead of repeating it.
+- With `MX_REFIT_PREFETCH_S3_WATCH=true`, it also lists the snapshot prefix of
+  the cache head (`<prefix>/<identity>/model.safetensors.index.json`). It
+  prepares a delta whose index names the head's identity as `base_version` once
+  every shard exists, before the version is registered. When the matching
+  version registers, the cache adopts the result by renaming it. If another
+  version is requested instead, the speculative delta is applied again to
+  restore its base exactly, since an XOR delta is its own inverse.
+- Speculation is one delta deep and covers deltas only. Full checkpoints are
+  prepared after registration.
+- Orchestrators may call `init_weight_transfer_engine` before every update. A
+  repeated call for the same model returns at once and asks the prefetcher to
+  poll. vLLM runs these calls inside its engine loop, so they never wait for
+  preparation.
+- An orchestrator that pauses a replica immediately after registering a version
+  gives the prefetcher no head start on that replica. The S3 watch narrows that
+  gap; later replicas in a rolling update are usually prepared before their
+  turn.
+- `MX_REFIT_PREFER_PREPARED=true` installs a prepared target from the local
+  cache before trying a generator peer. Enable it when the local install is
+  faster than a peer transfer of the whole model.
+- The prefetcher writes its last outcome to `prefetch.json` in the model's cache
+  directory. It runs at a lower CPU priority and exits with the engine process.

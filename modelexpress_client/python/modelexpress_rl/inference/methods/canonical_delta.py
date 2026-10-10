@@ -60,8 +60,22 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
         self._active: PreparedCheckpointArtifact | None = None
 
     @property
+    def model_name(self) -> str:
+        """Name keying this method's host checkpoint cache."""
+        return self._model_name
+
+    @property
     def requires_full_root(self) -> bool:
         return not self._initialized
+
+    def is_prepared(self, version: WeightVersion) -> bool:
+        """Return whether the local cache head already holds ``version``."""
+        if not self._initialized or version.object_storage is None:
+            return False
+        return self._checkpoint.is_prepared(
+            version_id=version.version_id,
+            uri=version.object_storage.uri,
+        )
 
     @property
     def capabilities(self) -> MethodCapabilities:

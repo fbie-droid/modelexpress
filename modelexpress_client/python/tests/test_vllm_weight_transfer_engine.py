@@ -302,11 +302,32 @@ def test_weight_transfer_engine_rejects_out_of_order_updates(monkeypatch):
     engine.finish_weight_update()
 
 
+def test_weight_transfer_engine_accepts_repeated_initialization(monkeypatch):
+    """Orchestrators initialize before every update; the repeat only nudges prefetch."""
+    monkeypatch.delenv("MX_MODEL_NAME_OVERRIDE", raising=False)
+    client = MagicMock(model_name="test/model")
+    engine, client = _engine(monkeypatch, client)
+
+    engine.init_transfer_engine(engine.init_info_cls())
+
+    client.notify_prefetch.assert_called_once_with()
+    engine.start_weight_update()
+    engine.update_weights({"version_id": "version-a"})
+    engine.finish_weight_update()
+
+
+def test_weight_transfer_engine_rejects_initialization_for_another_model(monkeypatch):
+    monkeypatch.delenv("MX_MODEL_NAME_OVERRIDE", raising=False)
+    engine, client = _engine(monkeypatch, MagicMock(model_name="test/model"))
+
+    with pytest.raises(RuntimeError, match="already initialized for model"):
+        engine.init_transfer_engine(engine.init_info_cls(model_name="other/model"))
+    client.notify_prefetch.assert_not_called()
+
+
 def test_weight_transfer_engine_rejects_duplicate_lifecycle_calls(monkeypatch):
     engine, client = _engine(monkeypatch)
 
-    with pytest.raises(RuntimeError, match="already initialized"):
-        engine.init_transfer_engine(engine.init_info_cls())
     engine.start_weight_update()
     with pytest.raises(RuntimeError, match="already active"):
         engine.start_weight_update()

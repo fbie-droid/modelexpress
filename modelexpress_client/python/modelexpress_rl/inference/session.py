@@ -87,10 +87,12 @@ class WeightUpdateSession:
         start_lease: Callable[[str], Any],
         resolve_replay_chain: Callable[[WeightVersion], tuple[WeightVersion, ...]]
         | None = None,
+        prefer_prepared: Callable[[WeightVersion], bool] | None = None,
     ) -> None:
         self._planner = planner
         self._start_lease = start_lease
         self._resolve_replay_chain = resolve_replay_chain
+        self._prefer_prepared = prefer_prepared
 
     def stage(
         self,
@@ -100,6 +102,18 @@ class WeightUpdateSession:
         source_order = self._planner.source_order
         if not source_order:
             raise RuntimeError("no refit source is configured")
+        if (
+            self._prefer_prepared is not None
+            and source_order[0] is not WeightSource.OBJECT_STORAGE
+            and WeightSource.OBJECT_STORAGE in source_order
+            and self._prefer_prepared(version)
+        ):
+            # A locally prepared target installs without a peer transfer.
+            source_order = (WeightSource.OBJECT_STORAGE,) + tuple(
+                source
+                for source in source_order
+                if source is not WeightSource.OBJECT_STORAGE
+            )
         if WeightSource.OBJECT_STORAGE not in source_order:
             return self._stage_one(version)
         for source_kind in source_order[:-1]:

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import mmap
 import shutil
@@ -97,6 +98,11 @@ _S3Manifest = tuple[_S3Version, bytes, dict[str, Any], dict[str, str]]
 
 def _source_identity(version: _S3Version) -> dict[str, str]:
     return {"uri": version.uri}
+
+
+def speculative_version_id(uri: str) -> str:
+    """Return the cache ID of a delta prepared before its version is registered."""
+    return "mx-speculative-" + hashlib.sha256(uri.encode()).hexdigest()[:24]
 
 
 _Decompressor = Callable[[memoryview], Any]
@@ -628,45 +634,170 @@ class _LocalCheckpoint:
         """Prepare an ordered chain into one immutable target checkpoint."""
         if not versions:
             raise ValueError("canonical replay chain is empty")
-        target = versions[-1]
         # Queue preparers separately so followers can reuse the target while
         # the leader installs it, without first waiting for an exclusive fence.
         with self.store.preparation_locked():
-            with self.store.installation_locked(shared=True), self.store.locked(
-                shared=True
-            ):
-                state, _active_version = self._load_ready_state()
-                prepared = self._reuse_prepared_target(state=state, target=target)
-                if prepared is not None:
-                    return prepared
+            return self._prepare_chain_locked(versions)
+
+    def prepare_speculative(self, version: _S3Version) -> PreparedCheckpoint:
+        """Prepare a delta that is not registered yet on top of the cache head.
+
+        The result keeps a speculative ID until a registered version with the same
+        URI and base adopts it during a later preparation.
+        """
+        with self.store.preparation_locked():
             with self.store.installation_locked(), self.store.locked():
-                state, active_version = self._load_ready_state()
-                prepared = self._reuse_prepared_target(state=state, target=target)
-                if prepared is not None:
-                    return prepared
-                # P2P can advance the engine without advancing this disk checkpoint.
-                # Choose the replay suffix from the verified cache head under lock.
-                for position, version in enumerate(versions[:-1]):
-                    if version.version_id != state.version:
-                        continue
-                    source = self.store.artifact_source(self._artifact_path(version))
-                    if source is None:
-                        break
-                    if source != _source_identity(version):
-                        raise ValueError("prepared checkpoint has different source identity")
-                    versions = versions[position + 1 :]
-                    break
-                manifests, index_download_time = self._download_replay_manifests(
-                    versions=versions,
-                    target=target,
+                state, _active_version = self._load_ready_state()
+                if state.version != version.base_version_id:
+                    raise RuntimeError("speculative base is no longer the cache head")
+                self.store.write_speculation(
+                    version=version.version_id,
+                    uri=version.uri,
                     base_version=state.version,
+                    base_source=state.source,
                 )
-                return self._reconstruct_target(
-                    manifests=manifests,
-                    target=target,
-                    active_version=active_version,
-                    index_download_time=index_download_time,
-                )
+            return self._prepare_chain_locked((version,))
+
+    def is_prepared(self, *, version_id: str, uri: str) -> bool:
+        """Return whether the cache head already holds this version."""
+        state = self.store.state()
+        if state is None or state.status is not CheckpointState.READY:
+            return False
+        if state.version == version_id:
+            return True
+        speculation = self.store.speculation()
+        return (
+            speculation is not None
+            and speculation.get("version") == state.version
+            and speculation.get("uri") == uri
+        )
+
+    def _resolve_speculation(self, versions: tuple[_S3Version, ...]) -> None:
+        """Adopt a matching speculative cache head, or undo one that is not wanted.
+
+        Callers hold the exclusive installation and cache locks. A crash while the
+        head changes leaves UPDATING, which initialization rebuilds from lineage.
+        """
+        speculation = self.store.speculation()
+        if speculation is None:
+            return
+        state = self.store.state()
+        if state is None or state.status is not CheckpointState.READY:
+            return
+        if state.version != speculation.get("version"):
+            if all(version.version_id != speculation.get("version") for version in versions):
+                # The speculative preparation never finished, or the head moved on.
+                self.store.clear_speculation()
+            return
+        registered = next(
+            (
+                version
+                for version in versions
+                if version.uri == speculation.get("uri")
+                and version.base_version_id == speculation.get("base_version")
+            ),
+            None,
+        )
+        self.store.write_state(
+            status=CheckpointState.UPDATING,
+            version=state.version,
+            checkpoint_paths=self.checkpoint_paths,
+        )
+        if registered is None:
+            self._revert_speculation(speculation)
+        else:
+            self.store.rename_version(state.version, registered.version_id)
+            self._set_local_checkpoint(self.store.checkpoint_path(registered.version_id))
+            self.store.write_state(
+                status=CheckpointState.READY,
+                version=registered.version_id,
+                checkpoint_paths=self.checkpoint_paths,
+                source=_source_identity(registered),
+            )
+        self.store.clear_speculation()
+
+    def _revert_speculation(self, speculation: dict[str, Any]) -> None:
+        """Restore the registered base under a speculative head.
+
+        XOR deltas are their own inverse, so applying the speculative delta again
+        restores the base bytes exactly. A full base was never modified.
+        """
+        version = _S3Version(
+            version_id=speculation["version"],
+            base_version_id=speculation["base_version"],
+            payload_format=WeightPayloadFormat.XOR_DELTA,
+            uri=speculation["uri"],
+        )
+        base_chain = self.store.chain(version.base_version_id)
+        if base_chain is None:
+            raise RuntimeError("speculative base chain is missing")
+        speculative_checkpoint = self.store.materialized_path(version.version_id)
+        if base_chain.get("deltas"):
+            artifact = self.store.delta_path(version.version_id)
+            index_data = (artifact / Path(version.uri).name).read_bytes()
+            metadata, weight_map = _parse_index_manifest(
+                index_data,
+                is_delta=True,
+                version=version,
+            )
+            self._set_local_checkpoint(speculative_checkpoint)
+            self._apply_delta_artifact(artifact, metadata, weight_map, verify=False)
+            base_checkpoint = self.store.materialized_path(version.base_version_id)
+            shutil.rmtree(base_checkpoint, ignore_errors=True)
+            speculative_checkpoint.replace(base_checkpoint)
+        else:
+            shutil.rmtree(speculative_checkpoint, ignore_errors=True)
+        self.store.chain_path(version.version_id).unlink(missing_ok=True)
+        shutil.rmtree(self.store.delta_path(version.version_id), ignore_errors=True)
+        self._set_local_checkpoint(self.store.checkpoint_path(version.base_version_id))
+        self.store.write_state(
+            status=CheckpointState.READY,
+            version=version.base_version_id,
+            checkpoint_paths=self.checkpoint_paths,
+            source=speculation.get("base_source"),
+        )
+
+    def _prepare_chain_locked(
+        self,
+        versions: tuple[_S3Version, ...],
+    ) -> PreparedCheckpoint:
+        target = versions[-1]
+        with self.store.installation_locked(shared=True), self.store.locked(
+            shared=True
+        ):
+            state, _active_version = self._load_ready_state()
+            prepared = self._reuse_prepared_target(state=state, target=target)
+            if prepared is not None:
+                return prepared
+        with self.store.installation_locked(), self.store.locked():
+            self._resolve_speculation(versions)
+            state, active_version = self._load_ready_state()
+            prepared = self._reuse_prepared_target(state=state, target=target)
+            if prepared is not None:
+                return prepared
+            # P2P can advance the engine without advancing this disk checkpoint.
+            # Choose the replay suffix from the verified cache head under lock.
+            for position, version in enumerate(versions[:-1]):
+                if version.version_id != state.version:
+                    continue
+                source = self.store.artifact_source(self._artifact_path(version))
+                if source is None:
+                    break
+                if source != _source_identity(version):
+                    raise ValueError("prepared checkpoint has different source identity")
+                versions = versions[position + 1 :]
+                break
+            manifests, index_download_time = self._download_replay_manifests(
+                versions=versions,
+                target=target,
+                base_version=state.version,
+            )
+            return self._reconstruct_target(
+                manifests=manifests,
+                target=target,
+                active_version=active_version,
+                index_download_time=index_download_time,
+            )
 
     def _load_ready_state(self) -> tuple[CheckpointRecord, str]:
         state = self.store.state()
@@ -1014,6 +1145,8 @@ class _LocalCheckpoint:
         artifact: Path,
         index_metadata: dict[str, Any],
         weight_map: dict[str, str],
+        *,
+        verify: bool = True,
     ) -> None:
         self.store.verify_artifact(artifact)
         shards = {
@@ -1023,7 +1156,7 @@ class _LocalCheckpoint:
             )
             for filename, names in _group_tensors_by_shard(weight_map).items()
         }
-        self._apply_shards(shards, index_metadata=index_metadata)
+        self._apply_shards(shards, index_metadata=index_metadata, verify=verify)
 
     def _download_deltas(
         self,
@@ -1078,6 +1211,7 @@ class _LocalCheckpoint:
         shards: dict[str, tuple[bytes, list[str]]],
         *,
         index_metadata: dict[str, Any],
+        verify: bool = True,
     ) -> None:
         if not shards:
             return
@@ -1159,7 +1293,8 @@ class _LocalCheckpoint:
                     del target
                 if position != size or extra:
                     raise ValueError(f"canonical delta byte size differs for {name!r}")
-                if checksum.hexdigest() != expected_checksum:
+                # Checksums describe the delta's target, not a reverted base.
+                if verify and checksum.hexdigest() != expected_checksum:
                     raise ValueError(f"canonical target checksum differs for {name!r}")
 
             list(

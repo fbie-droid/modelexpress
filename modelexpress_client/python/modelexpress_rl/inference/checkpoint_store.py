@@ -155,6 +155,7 @@ class LocalCheckpointStore:
         #     chains/<version>.json     full ancestor plus ordered deltas
         #     materialized/<version>/   derived, installable full checkpoints
         #     state.json                current preparation transaction
+        #     speculation.json          unregistered target being prepared ahead
         #     active.json               version committed after engine install
         #     .lock                     cross-process cache coordination
         #     .prepare.lock             serializes preparation requests
@@ -171,6 +172,7 @@ class LocalCheckpointStore:
         self.chain_cache = self.cache / "chains"
         self.materialized_cache = self.cache / "materialized"
         self.state_path = self.cache / "state.json"
+        self.speculation_path = self.cache / "speculation.json"
         self.active_path = self.cache / "active.json"
         self.lock_path = self.cache / ".lock"
         self.prepare_lock_path = self.cache / ".prepare.lock"
@@ -432,6 +434,59 @@ class LocalCheckpointStore:
             source=source,
         )
         self._write_json(self.state_path, state.to_dict())
+
+    def speculation(self) -> dict | None:
+        """Return the unregistered target prepared ahead of its registration."""
+        return self._read_json(self.speculation_path)
+
+    def write_speculation(
+        self,
+        *,
+        version: str,
+        uri: str,
+        base_version: str,
+        base_source: dict[str, str] | None,
+    ) -> None:
+        self._write_json(
+            self.speculation_path,
+            {
+                "version": version,
+                "uri": uri,
+                "base_version": base_version,
+                "base_source": base_source,
+            },
+        )
+
+    def clear_speculation(self) -> None:
+        self.speculation_path.unlink(missing_ok=True)
+
+    def rename_version(self, old: str, new: str) -> None:
+        """Move one version's artifacts and chain references to another ID.
+
+        Callers hold the exclusive cache lock and own the state transition.
+        """
+        for path_for in (self.full_path, self.delta_path, self.materialized_path):
+            source, target = path_for(old), path_for(new)
+            if source.exists():
+                shutil.rmtree(target, ignore_errors=True)
+                source.replace(target)
+        for chain_file in sorted(self.chain_cache.glob("*.json")):
+            chain = self._read_json(chain_file)
+            if chain is None:
+                continue
+            renamed = dict(chain)
+            for key in ("version", "full_version"):
+                if renamed.get(key) == old:
+                    renamed[key] = new
+            if isinstance(renamed.get("deltas"), list):
+                renamed["deltas"] = [
+                    new if delta == old else delta for delta in renamed["deltas"]
+                ]
+            if renamed != chain:
+                self._write_json(chain_file, renamed)
+        old_chain = self.chain_path(old)
+        if old_chain.exists():
+            old_chain.replace(self.chain_path(new))
 
     def chain(self, version: str) -> dict | None:
         return self._read_json(self.chain_path(version))

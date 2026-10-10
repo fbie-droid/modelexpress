@@ -108,7 +108,21 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
         if self._closed:
             raise RuntimeError("weight transfer engine is shut down")
         if self._client is not None:
-            raise RuntimeError("weight transfer engine is already initialized")
+            model_name = (
+                init_info.model_name
+                if init_info.model_name is not None
+                else self._model_name
+            )
+            if model_name != self._client.model_name:
+                raise RuntimeError(
+                    "weight transfer engine is already initialized for model "
+                    f"{self._client.model_name!r}"
+                )
+            # Orchestrators may initialize before every update. vLLM runs this call
+            # inside its engine loop, so it only asks the prefetcher to poll.
+            self._client.notify_prefetch()
+            logger.info("ModelExpress weight transfer already initialized model=%s", model_name)
+            return
 
         object_storage_values = (
             init_info.object_storage_type,

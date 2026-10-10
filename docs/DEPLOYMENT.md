@@ -1096,6 +1096,14 @@ The receiver marks its local checkpoint `UPDATING` before mutation and `READY`
 only after success. An interrupted update remains unavailable until a fresh
 initialization reseeds it from `seed_checkpoint_path`.
 
+To keep download and reconstruction out of the serving pause, set
+`MX_REFIT_PREFETCH=true` on generators. A background process per host cache
+then prepares each newly registered version while the engine serves;
+`MX_REFIT_PREFETCH_S3_WATCH=true` also prepares deltas found in S3 before they
+are registered. See
+[Background prefetch](S3_DELTA_WEIGHT_REFIT.md#background-prefetch) for the
+behavior and the related settings.
+
 S3 versions normally use `XOR_DELTA`. Integrations may opt into a
 framework-selected cadence of `FULL_HF_CHECKPOINT` versions; these publish
 native HF safetensor shards, omit `base_version_id`, and become the exact base

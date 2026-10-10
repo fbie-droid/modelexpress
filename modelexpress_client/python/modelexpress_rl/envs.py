@@ -33,6 +33,11 @@ if TYPE_CHECKING:
     MX_REFIT_DELTA_WORKERS: int
     MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES: int
     MX_REFIT_METADATA_PORT: int
+    MX_REFIT_PREFER_PREPARED: bool
+    MX_REFIT_PREFETCH: bool
+    MX_REFIT_PREFETCH_POLL_SECONDS: float
+    MX_REFIT_PREFETCH_S3_WATCH: bool
+    MX_REFIT_PREFETCH_WORKERS: int
     MX_REFIT_TIMING: bool
     MX_S3_DOWNLOAD_RANGE_BYTES: int
     MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES: int
@@ -183,6 +188,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_REFIT_TIMING": lambda: parse_bool(
         os.environ.get("MX_REFIT_TIMING", "true"),
         "MX_REFIT_TIMING",
+    ),
+    # Background preparation of object-storage refits outside the serving pause.
+    "MX_REFIT_PREFETCH": lambda: parse_bool(
+        os.environ.get("MX_REFIT_PREFETCH", "false"),
+        "MX_REFIT_PREFETCH",
+    ),
+    "MX_REFIT_PREFETCH_POLL_SECONDS": lambda: require_positive_float(
+        float(os.environ.get("MX_REFIT_PREFETCH_POLL_SECONDS", "2")),
+        "MX_REFIT_PREFETCH_POLL_SECONDS",
+    ),
+    "MX_REFIT_PREFETCH_S3_WATCH": lambda: parse_bool(
+        os.environ.get("MX_REFIT_PREFETCH_S3_WATCH", "false"),
+        "MX_REFIT_PREFETCH_S3_WATCH",
+    ),
+    "MX_REFIT_PREFETCH_WORKERS": lambda: positive_int_env(
+        "MX_REFIT_PREFETCH_WORKERS", min(8, os.cpu_count() or 8)
+    ),
+    "MX_REFIT_PREFER_PREPARED": lambda: parse_bool(
+        os.environ.get("MX_REFIT_PREFER_PREPARED", "false"),
+        "MX_REFIT_PREFER_PREPARED",
     ),
     "RANK": lambda: os.environ.get("RANK"),
 }
