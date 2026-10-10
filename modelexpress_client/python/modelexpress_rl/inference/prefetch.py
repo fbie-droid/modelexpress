@@ -128,6 +128,7 @@ class RefitPrefetcher:
         self._channel: grpc.Channel | None = None
         # Servers that predate version listing still support the S3 watch.
         self._registry_listing = True
+        self._writer_versions: dict[str, str] = {}
 
     @classmethod
     def connect(cls, settings: PrefetchSettings) -> RefitPrefetcher:
@@ -295,18 +296,20 @@ class RefitPrefetcher:
         head_uri = (head_source or {}).get("uri") or self._registered_uri(head)
         if head_uri is None:
             return None
-        # Snapshots live at <prefix>/<identity>/<index>; deltas name their base identity.
+        # Snapshots live at <prefix>/<identity>/<index>, and identities sort in
+        # publish order. A delta names its base by the writer's version string.
         snapshot = posixpath.dirname(head_uri)
         identity = posixpath.basename(snapshot)
         prefix = posixpath.dirname(snapshot)
         index_name = posixpath.basename(head_uri)
         if not identity or not prefix.startswith("s3://"):
             return None
+        head_version = self._writer_version(head_uri, default=identity)
         for child in self._s3.list_children(prefix, start_after=identity):
             if child <= identity or child.startswith(("_", ".")):
                 continue
             uri = f"{prefix}/{child}/{index_name}"
-            if not self._is_complete_child_delta(uri, base_identity=identity):
+            if not self._is_complete_child_delta(uri, base_version=head_version):
                 continue
             version = _S3Version(
                 version_id=speculative_version_id(uri),
@@ -331,7 +334,18 @@ class RefitPrefetcher:
             return None
         return version.object_storage.uri
 
-    def _is_complete_child_delta(self, uri: str, *, base_identity: str) -> bool:
+    def _writer_version(self, uri: str, *, default: str) -> str:
+        """Return the version the snapshot's writer recorded, or ``default``."""
+        if uri not in self._writer_versions:
+            try:
+                index = json.loads(self._s3.get(uri))
+                version = index["metadata"]["version"]
+            except Exception:
+                version = None
+            self._writer_versions[uri] = version if isinstance(version, str) else default
+        return self._writer_versions[uri]
+
+    def _is_complete_child_delta(self, uri: str, *, base_version: str) -> bool:
         try:
             index = json.loads(self._s3.get(uri))
         except Exception:
@@ -342,7 +356,7 @@ class RefitPrefetcher:
             not isinstance(metadata, dict)
             or not isinstance(weight_map, dict)
             or metadata.get("delta_encoding") != "xor"
-            or metadata.get("base_version") != base_identity
+            or metadata.get("base_version") != base_version
         ):
             return False
         # Writers upload the index last, but every shard must exist before reading.

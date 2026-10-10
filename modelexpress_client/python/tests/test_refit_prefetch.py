@@ -54,7 +54,7 @@ def _uri(identity):
     return f"{PREFIX}/{identity}/{INDEX}"
 
 
-def _delta_snapshot(base, target, *, identity, base_identity):
+def _delta_snapshot(base, target, *, identity, base_identity, version=None):
     delta, _ = compute_delta(_bytes(target), _bytes(base))
     shard = safetensors.numpy.save(
         {"weight": compress_delta(delta)},
@@ -63,7 +63,7 @@ def _delta_snapshot(base, target, *, identity, base_identity):
     index = json.dumps(
         {
             "metadata": {
-                "version": identity,
+                "version": version or identity,
                 "base_version": base_identity,
                 "delta_encoding": "xor",
                 "compression_format": "zstd",
@@ -376,6 +376,34 @@ def test_speculation_ignores_snapshots_of_other_bases(tmp_path):
 
     assert prefetcher.poll_once() is None
     assert checkpoint.store.state().version == "base"
+
+
+def test_speculation_links_deltas_by_writer_version(tmp_path):
+    # Writers name directories and versions independently, as in weight_v000001/.
+    objects = {
+        _uri("weight_v000000"): json.dumps(
+            {"metadata": {"version": "000000"}, "weight_map": {"weight": SHARD}}
+        ).encode(),
+        **_delta_snapshot(
+            [1.0, 2.0],
+            [1.0, 3.0],
+            identity="weight_v000001",
+            base_identity="000000",
+            version="000001",
+        ),
+    }
+    s3 = _FakeS3(objects)
+    checkpoint = _checkpoint(tmp_path, s3)
+    refit = _FakeRefit()
+    refit.add("base", payload=FULL, uri=_uri("weight_v000000"), created=1)
+    prefetcher = prefetch_module.RefitPrefetcher(
+        _settings(tmp_path, s3_watch=True), service=refit, s3=s3, checkpoint=checkpoint
+    )
+
+    speculative = prefetcher.poll_once()
+
+    assert speculative == receiver_module.speculative_version_id(_uri("weight_v000001"))
+    assert checkpoint.store.state().version == speculative
 
 
 def test_prefetcher_keeps_a_speculative_head_ahead_of_its_base(tmp_path):

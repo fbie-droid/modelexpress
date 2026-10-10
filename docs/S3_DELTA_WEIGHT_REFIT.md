@@ -643,9 +643,11 @@ sequenceDiagram
   as the engine's own update. An update that arrives while preparation runs
   waits for it instead of repeating it.
 - With `MX_REFIT_PREFETCH_S3_WATCH=true`, it also lists the snapshot prefix of
-  the cache head (`<prefix>/<identity>/model.safetensors.index.json`). It
-  prepares a delta whose index names the head's identity as `base_version` once
-  every shard exists, before the version is registered. When the matching
+  the cache head (`<prefix>/<identity>/model.safetensors.index.json`) for
+  identities that sort after the head's. It prepares a delta whose index
+  `base_version` equals the head index's `version` (or the head's identity when
+  the head index records no version) once every shard exists, before the
+  version is registered. When the matching
   version registers, the cache adopts the result by renaming it. If another
   version is requested instead, the speculative delta is applied again to
   restore its base exactly, since an XOR delta is its own inverse.
