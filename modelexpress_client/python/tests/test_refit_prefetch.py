@@ -10,6 +10,7 @@ import os
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import grpc
 import pytest
 import safetensors.numpy
 import torch
@@ -333,6 +334,26 @@ def test_prefetcher_adopts_its_speculation_on_registration(tmp_path):
     assert prefetcher.poll_once() == "v1"
     assert checkpoint.store.state().version == "v1"
     assert len(s3.gets) == downloads
+
+
+def test_speculation_runs_when_the_server_cannot_list_versions(tmp_path):
+    class _Unimplemented(grpc.RpcError):
+        def code(self):
+            return grpc.StatusCode.UNIMPLEMENTED
+
+    objects = _delta_snapshot(
+        [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
+    )
+    _s3, checkpoint, refit, prefetcher = _setup(tmp_path, objects, s3_watch=True)
+    refit.ListWeightVersions = Mock(side_effect=_Unimplemented())
+
+    speculative = prefetcher.poll_once()
+
+    assert speculative == receiver_module.speculative_version_id(_uri("run-v000001"))
+    assert checkpoint.store.state().version == speculative
+    # Listing is not retried once the server reports it unimplemented.
+    assert prefetcher.poll_once() is None
+    refit.ListWeightVersions.assert_called_once()
 
 
 def test_speculation_waits_for_every_shard(tmp_path):
