@@ -450,6 +450,33 @@ def test_prefetcher_waits_until_the_engine_activates_the_head(tmp_path):
     )
 
 
+def test_colocated_ranks_reuse_a_prepared_head_outside_the_preparation_queue(
+    monkeypatch, tmp_path
+):
+    objects = _delta_snapshot(
+        [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
+    )
+    s3 = _FakeS3(objects)
+    leader = _checkpoint(tmp_path, s3)
+    target = _delta("v1", base="base", identity="run-v000001")
+    leader.prepare_chain((target,))
+    follower = _checkpoint(tmp_path, s3, initialize=False)
+    reuse = follower._reuse_prepared_target
+
+    def reuse_without_queue(**kwargs):
+        with follower.store.prepare_lock_path.open("a+") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        return reuse(**kwargs)
+
+    monkeypatch.setattr(follower, "_reuse_prepared_target", reuse_without_queue)
+
+    prepared = follower.prepare_chain((target,))
+
+    assert prepared.target_version == "v1"
+    assert torch.equal(_weight(prepared), torch.tensor([1.0, 3.0]))
+
+
 def test_prefetcher_keeps_a_speculative_head_ahead_of_its_base(tmp_path):
     objects = _delta_snapshot(
         [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"

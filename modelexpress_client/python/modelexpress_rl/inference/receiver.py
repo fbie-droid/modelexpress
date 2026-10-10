@@ -634,10 +634,27 @@ class _LocalCheckpoint:
         """Prepare an ordered chain into one immutable target checkpoint."""
         if not versions:
             raise ValueError("canonical replay chain is empty")
-        # Queue preparers separately so followers can reuse the target while
-        # the leader installs it, without first waiting for an exclusive fence.
-        with self.store.preparation_locked():
-            return self._prepare_chain_locked(versions)
+        target = versions[-1]
+        while True:
+            # Queue preparers separately so followers can reuse the target while
+            # the leader installs it, without first waiting for an exclusive fence.
+            with self.store.preparation_locked():
+                state = self.store.state()
+                if (
+                    state is None
+                    or state.status is not CheckpointState.READY
+                    or state.version != target.version_id
+                ):
+                    return self._prepare_chain_locked(versions)
+            # Co-located ranks verify a target that is already the cache head
+            # concurrently rather than one at a time in the preparation queue.
+            with self.store.installation_locked(shared=True), self.store.locked(
+                shared=True
+            ):
+                state, _active_version = self._load_ready_state()
+                prepared = self._reuse_prepared_target(state=state, target=target)
+            if prepared is not None:
+                return prepared
 
     def prepare_speculative(self, version: _S3Version) -> PreparedCheckpoint:
         """Prepare a delta that is not registered yet on top of the cache head.
