@@ -229,6 +229,13 @@ def routed_expert_layers(model: torch.nn.Module) -> dict[int, torch.nn.Module]:
     return found
 
 
+def _expert_param(meta: dict, prefix: str, kind: str) -> str | None:
+    """Name of the load-time parameter holding one checkpoint tensor kind."""
+    # Some methods load packed weights into ``w13_weight`` rather than ``w13_weight_packed``.
+    names = [f"{prefix}_{kind}"] + ([f"{prefix}_weight"] if kind == "weight_packed" else [])
+    return next((name for name in names if name in meta), None)
+
+
 def arrange_expert_delta(
     layer: torch.nn.Module,
     staged: StagedDelta,
@@ -250,14 +257,22 @@ def arrange_expert_delta(
     if getattr(parallel, "ep_size", 1) != 1:
         raise InPlaceUnsupported("expert parallelism is not supported")
     tp_size, tp_rank = parallel.tp_size, layer.moe_config.tp_rank
-    kinds = [kind for kind in _ARRANGED_KINDS if f"w13_{kind}" in meta and f"w2_{kind}" in meta]
+    present = {kind for (_expert, _proj, kind) in expert_names}
+    params = {
+        kind: (w13, w2)
+        for kind in _ARRANGED_KINDS
+        if kind in present
+        and (w13 := _expert_param(meta, "w13", kind)) is not None
+        and (w2 := _expert_param(meta, "w2", kind)) is not None
+    }
     changed = {kind for (_expert, _proj, kind), name in expert_names.items() if name in staged}
-    if not kinds or changed - set(kinds):
-        raise InPlaceUnsupported(f"unsupported expert tensors {sorted(changed - set(kinds))}")
-    transposed = bool(getattr(meta[f"w13_{kinds[0]}"], "is_transposed", False))
-    experts = meta[f"w13_{kinds[0]}"].shape[0]
+    if not params or changed - set(params):
+        raise InPlaceUnsupported(f"unsupported expert tensors {sorted(changed - set(params))}")
+    first = next(iter(params.values()))[0]
+    transposed = bool(getattr(meta[first], "is_transposed", False))
+    experts = meta[first].shape[0]
     arranged: dict[str, torch.Tensor] = {}
-    for kind in kinds:
+    for kind, (w13_name, w2_name) in params.items():
         parts = {}
         for proj in ("gate", "up", "down"):
             sample = expert_names.get((0, proj, kind))
@@ -284,7 +299,7 @@ def arrange_expert_delta(
             tensor = scratch.view(dtype).view(experts, *shard)
             parts[proj] = tensor.transpose(1, 2) if transposed else tensor
         w13 = torch.cat([parts["gate"], parts["up"]], dim=2 if transposed else 1).contiguous()
-        for name, tensor in ((f"w13_{kind}", w13), (f"w2_{kind}", parts["down"].contiguous())):
+        for name, tensor in ((w13_name, w13), (w2_name, parts["down"].contiguous())):
             if tuple(tensor.shape) != tuple(meta[name].shape) or tensor.dtype != meta[name].dtype:
                 raise InPlaceUnsupported(
                     f"{name} layout {tuple(tensor.shape)} differs from {tuple(meta[name].shape)}"

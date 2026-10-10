@@ -325,6 +325,36 @@ def test_expert_layout_follows_the_weight_loader_rules(monkeypatch, tmp_path, tp
     staged.close()
 
 
+def test_packed_experts_may_load_into_plain_weight_parameters(monkeypatch, tmp_path):
+    experts, rows, cols = 2, 4, 3
+    dense, tensors, names, metadata = {}, {}, {}, {}
+    for expert in range(experts):
+        for proj, shape in (("w1", (rows, cols)), ("w3", (rows, cols)), ("w2", (cols, rows))):
+            name = f"language_model.model.layers.1.block_sparse_moe.experts.{expert}.{proj}.weight_packed"
+            value = torch.randint(0, 255, shape, dtype=torch.uint8)
+            dense[(expert, proj)] = value
+            tensors[name] = (np.zeros(value.numel(), dtype=np.uint8), value.reshape(-1).numpy())
+            metadata[name] = {"shape": list(shape), "dtype": "U8", "byte_size": value.numel()}
+            match = inplace_module._EXPERT.search(name)
+            names[(expert, inplace_module._PROJECTIONS[match[3]], match[4])] = name
+    staged = _stage(tmp_path / "staging", tensors)
+    meta = {
+        "w13_weight": torch.empty((experts, 2 * rows, cols), dtype=torch.uint8, device="meta"),
+        "w2_weight": torch.empty((experts, cols, rows), dtype=torch.uint8, device="meta"),
+    }
+    _fake_layerwise(monkeypatch, meta)
+    layer = SimpleNamespace(
+        moe_config=SimpleNamespace(moe_parallel_config=SimpleNamespace(tp_size=1, ep_size=1), tp_rank=0)
+    )
+
+    arranged = inplace_module.arrange_expert_delta(layer, staged, names, metadata, device=torch.device("cpu"))
+
+    expected = torch.stack([torch.cat([dense[(e, "w1")], dense[(e, "w3")]]) for e in range(experts)])
+    assert torch.equal(arranged["w13_weight"], expected)
+    assert torch.equal(arranged["w2_weight"], torch.stack([dense[(e, "w2")] for e in range(experts)]))
+    staged.close()
+
+
 def test_layers_of_other_pipeline_stages_are_skipped(monkeypatch, tmp_path):
     class PPMissingLayer(torch.nn.Module):
         pass
