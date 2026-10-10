@@ -855,7 +855,11 @@ class _LocalCheckpoint:
         )
 
     def _delta_changes(self, version_id: str) -> tuple[DeltaChange, ...]:
-        """Changed names per delta from the full root, or ``()`` if unknown."""
+        """Changed names per delta from the full root, or ``()`` if unknown.
+
+        The chain record orders deltas by registry lineage. Index metadata names
+        writer versions, which need not equal registry version IDs.
+        """
         if not rl_envs.MX_REFIT_DELTA_SURGICAL:
             return ()
         chain = self.store.chain(version_id)
@@ -878,7 +882,7 @@ class _LocalCheckpoint:
             if (
                 not isinstance(weight_map, dict)
                 or not isinstance(metadata, dict)
-                or metadata.get("base_version") != base
+                or metadata.get("delta_encoding") != "xor"
             ):
                 return ()
             changes.append(DeltaChange(base, delta, frozenset(weight_map)))

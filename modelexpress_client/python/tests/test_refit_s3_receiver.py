@@ -1280,6 +1280,40 @@ def test_canonical_s3_prepared_delta_records_changed_tensor_lineage(
     adapter.close()
 
 
+def test_changed_tensor_lineage_does_not_require_writer_versions_to_match_ids(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("MX_REFIT_DELTA_SURGICAL", "true")
+    base = torch.tensor([1.0, 2.0])
+    first = torch.tensor([3.0, 4.0])
+    target = torch.tensor([5.0, 6.0])
+    objects = _artifact(
+        base.view(torch.uint8).numpy(),
+        first.view(torch.uint8).numpy(),
+        version="000001",
+        base_version="000000",
+    )
+    objects.update(
+        _artifact(
+            first.view(torch.uint8).numpy(),
+            target.view(torch.uint8).numpy(),
+            version="000002",
+            version_label=2,
+            base_version="000001",
+        )
+    )
+    adapter, _ = _build(monkeypatch, tmp_path, objects)
+
+    staged = adapter.stage_chain(_two_delta_chain())
+
+    assert staged.delta_changes == (
+        receiver_module.DeltaChange("base-a", "target-a", frozenset({"weight"})),
+        receiver_module.DeltaChange("target-a", "target-b", frozenset({"weight"})),
+    )
+    adapter.release_staged_weight(staged)
+    adapter.close()
+
+
 def test_colocated_rank_reusing_prepared_target_gets_the_same_lineage(
     monkeypatch, tmp_path
 ):
@@ -3461,7 +3495,7 @@ def test_disabled_surgical_does_not_read_lineage(monkeypatch, tmp_path, flag):
     [
         [],
         {"metadata": [], "weight_map": {}},
-        {"metadata": {"base_version": "wrong"}, "weight_map": {}},
+        {"metadata": {"delta_encoding": "overwrite"}, "weight_map": {}},
     ],
 )
 def test_malformed_delta_lineage_falls_back(monkeypatch, tmp_path, index):
