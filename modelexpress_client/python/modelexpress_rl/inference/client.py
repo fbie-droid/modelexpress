@@ -331,6 +331,11 @@ class ModelExpressGeneratorClient:
             )
             if client._serving_version_id is not None:
                 client._validate_initial_serving_version(client._serving_version_id)
+                # The engine holds this version's bytes, so the first delta from it
+                # can install without a full reload.
+                record_live = getattr(runtime.engine.installer, "record_live_version", None)
+                if record_live is not None:
+                    record_live(client._serving_version_id)
             client._register_worker()
             client._registration_thread = threading.Thread(
                 target=client._renew_worker_registration,

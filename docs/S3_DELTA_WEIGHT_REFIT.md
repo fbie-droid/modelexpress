@@ -713,6 +713,10 @@ flowchart LR
   post-load processing once. Every other changed tensor goes through the
   layerwise reload with the final copy replaced by an XOR.
 - Live storage keeps its addresses, so CUDA graphs stay valid.
+- After the engine starts, it holds `initial_serving_version_id` when the
+  orchestrator passes one, and otherwise `initial_base_version_id`. The first
+  delta from that version installs in place, or surgically, without a full
+  reload.
 - The update falls back to a reload when the engine does not hold the delta's
   base, when a layer is not supported (expert parallelism, an unexpected expert
   tensor, or a layout mismatch), or when the staging is missing. Anything

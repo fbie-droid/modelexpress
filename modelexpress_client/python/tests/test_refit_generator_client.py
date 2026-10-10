@@ -1209,6 +1209,29 @@ def test_generator_uses_engine_observed_serving_version_after_cold_start(
     assert adapter.stage_calls == []
 
 
+def test_generator_tells_the_installer_which_version_it_serves(monkeypatch):
+    """The installer can apply a delta from the serving version without a reload."""
+    server, endpoint, service = _start_server()
+    service.version.uid = "version-a"
+    recorded = []
+    monkeypatch.setattr(
+        _TestInstaller,
+        "record_live_version",
+        lambda _self, version_id: recorded.append(version_id),
+        raising=False,
+    )
+    generator = _initialize(
+        monkeypatch,
+        endpoint,
+        _Adapter(service),
+        initial_serving_version_id="version-a",
+    )
+    generator.close()
+    server.stop(grace=None).wait()
+
+    assert recorded == ["version-a"]
+
+
 def _canonical_version(uid, base_version_id):
     return refit_pb2.WeightVersion(
         uid=uid,

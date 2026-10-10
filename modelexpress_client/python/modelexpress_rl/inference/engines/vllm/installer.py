@@ -1135,6 +1135,10 @@ class _VllmInstaller(EngineInstaller):
         with refit_span("post_install"):
             torch.cuda.synchronize(self._device)
 
+    def record_live_version(self, version_id: str) -> None:
+        """Record the version whose checkpoint bytes the engine holds."""
+        self._live_version = version_id
+
     def _install_in_place(
         self, checkpoint: PreparedCheckpoint, *, live_version: str | None
     ) -> dict[str, float] | None:
