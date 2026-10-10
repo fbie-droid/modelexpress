@@ -368,11 +368,12 @@ class InPlaceInstaller:
         self._device = device
         self._generic_reload = generic_reload
         self._experts = routed_expert_layers(model)
-        # Pipeline-parallel ranks hold placeholders for other stages' layers.
-        self._other_stage_layers = {
+        # Layers this rank does not serve: other pipeline stages' placeholders,
+        # and checkpoint layers the model never builds, such as unused MTP layers.
+        self._served_layers = {
             key
             for path, module in model.named_modules()
-            if type(module).__name__ == "PPMissingLayer" and (key := layer_key(path)) is not None
+            if type(module).__name__ != "PPMissingLayer" and (key := layer_key(path)) is not None
         }
         # Processed zeros per expert layout; None when processing maps zero to zero.
         self._zero_terms: dict[tuple, dict[str, torch.Tensor] | None] = {}
@@ -391,20 +392,16 @@ class InPlaceInstaller:
 
     def _install(self, checkpoint: str | Path, staged: StagedDelta) -> dict[str, float]:
         _paths, _locations, metadata = index_checkpoint_tensors(checkpoint)
-        changed = [name for name in staged.names() if name in metadata]
-        if len(changed) != len(staged.names()):
+        if any(name not in metadata for name in staged.names()):
             raise InPlaceUnsupported("staged tensors are missing from the checkpoint")
+        changed = [name for name in staged.names() if self._served(name)]
         expert_names: dict[int, dict[tuple[int, str, str], str]] = defaultdict(dict)
         for name in metadata:
             match = _EXPERT.search(name)
             if match:
                 key = (int(match[2]), _PROJECTIONS[match[3]], match[4])
                 expert_names[int(match[1])][key] = name
-        expert_layers = sorted(
-            index
-            for index in {layer_key(name) for name in changed if is_per_expert(name)}
-            if index not in self._other_stage_layers
-        )
+        expert_layers = sorted({layer_key(name) for name in changed if is_per_expert(name)})
         missing = [index for index in expert_layers if index not in self._experts]
         if missing:
             raise InPlaceUnsupported(f"no routed-expert module for layers {missing[:5]}")
@@ -424,6 +421,10 @@ class InPlaceInstaller:
             "perf/mx_receive_inplace_generic_tensors": float(fed),
             "perf/mx_receive_inplace_generic_time": time.perf_counter() - generic_started,
         }
+
+    def _served(self, name: str) -> bool:
+        key = layer_key(name)
+        return key is None or key in self._served_layers
 
     def _install_experts(
         self,
@@ -458,7 +459,11 @@ class InPlaceInstaller:
         groups = {layer_key(name) for name in changed if not is_per_expert(name)}
         if not groups:
             return 0
-        fed = [name for name in metadata if not is_per_expert(name) and layer_key(name) in groups]
+        fed = [
+            name
+            for name in metadata
+            if not is_per_expert(name) and layer_key(name) in groups and self._served(name)
+        ]
         staged_names = set(changed)
         # Some loaders write live storage directly: tensors reload leaves in place,
         # such as biases, and mirrors a loader keeps, such as fp32 decode copies.

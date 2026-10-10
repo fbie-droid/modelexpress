@@ -420,6 +420,28 @@ def test_generic_install_handles_loaders_that_write_live_storage(monkeypatch, tm
     staged.close()
 
 
+def test_checkpoint_layers_the_model_does_not_build_are_skipped(monkeypatch, tmp_path):
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList([torch.nn.Module()])
+    monkeypatch.setattr(inplace_module, "_routed_experts_class", lambda: None)
+    installer = inplace_module.InPlaceInstaller(model, device=torch.device("cpu"), generic_reload=lambda load: None)
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    # Layer 1 is a speculative-decoding layer this model does not serve.
+    names = ["model.layers.1.mlp.experts.0.gate_proj.weight", "model.layers.1.eh_proj.weight"]
+    save_file({name: torch.zeros(2, dtype=torch.int32) for name in names}, checkpoint / "model.safetensors")
+    staged = _stage(
+        tmp_path / "staging",
+        {name: (np.zeros(8, dtype=np.uint8), np.arange(8, dtype=np.uint8)) for name in names},
+    )
+
+    metrics = installer._install(checkpoint, staged)
+
+    assert metrics["perf/mx_receive_inplace_expert_layers"] == 0
+    assert metrics["perf/mx_receive_inplace_generic_tensors"] == 0
+    staged.close()
+
+
 def test_xor_into_rejects_mismatched_storage():
     target = torch.zeros(4, dtype=torch.int32)
     inplace_module.xor_into(target, torch.ones(4, dtype=torch.int32))
