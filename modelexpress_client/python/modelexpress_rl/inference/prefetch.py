@@ -126,6 +126,8 @@ class RefitPrefetcher:
         self._checkpoint = checkpoint
         self._store = checkpoint.store
         self._channel: grpc.Channel | None = None
+        # Servers that predate version listing still support the S3 watch.
+        self._registry_listing = True
 
     @classmethod
     def connect(cls, settings: PrefetchSettings) -> RefitPrefetcher:
@@ -158,7 +160,7 @@ class RefitPrefetcher:
         state = self._store.state()
         if state is None or state.status is not CheckpointState.READY:
             return None
-        target = self._newest_registered()
+        target = self._newest_registered() if self._registry_listing else None
         if target is not None and self._should_prepare(target, head=state.version):
             chain = self._registered_chain(target, head=state.version)
             if chain is not None:
@@ -210,10 +212,18 @@ class RefitPrefetcher:
         )
 
     def _newest_registered(self) -> WeightVersion | None:
-        response = self._service.ListWeightVersions(
-            refit_pb2.ListWeightVersionsRequest(model_name=self._settings.model_name),
-            timeout=self._settings.rpc_timeout_seconds,
-        )
+        try:
+            response = self._service.ListWeightVersions(
+                refit_pb2.ListWeightVersionsRequest(model_name=self._settings.model_name),
+                timeout=self._settings.rpc_timeout_seconds,
+            )
+        except grpc.RpcError as error:
+            if error.code() is grpc.StatusCode.UNIMPLEMENTED:
+                self._registry_listing = False
+                logger.info("MX server cannot list versions; prefetch watches S3 only")
+            else:
+                logger.warning("prefetch could not list versions: %s", error)
+            return None
         candidates = []
         for message in response.versions:
             try:
