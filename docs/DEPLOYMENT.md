@@ -1107,6 +1107,10 @@ are registered. See
 [Background prefetch](S3_DELTA_WEIGHT_REFIT.md#background-prefetch) for the
 behavior and the related settings.
 
+`MX_REFIT_INPLACE=true` additionally installs a prepared delta into live vLLM
+weights in place instead of reloading every tensor; see
+[In-place install](S3_DELTA_WEIGHT_REFIT.md#in-place-install).
+
 S3 versions normally use `XOR_DELTA`. Integrations may opt into a
 framework-selected cadence of `FULL_HF_CHECKPOINT` versions; these publish
 native HF safetensor shards, omit `base_version_id`, and become the exact base

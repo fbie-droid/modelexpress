@@ -27,6 +27,12 @@ from modelexpress_rl.inference.checkpoint_store import (
     LocalCheckpointStore,
     checkpoint_files_state,
 )
+from modelexpress_rl.inference.staging import (
+    StagedDelta,
+    join_nonzero,
+    nonzero_bytes,
+    write_staging,
+)
 from modelexpress_rl.object_storage import ObjectStorageType
 from modelexpress_rl.s3 import S3Client
 from modelexpress_rl.train import WeightPayloadFormat
@@ -98,6 +104,9 @@ class PreparedCheckpoint:
     streaming: StreamedCheckpoint | None = None
     # Deltas from the target's full root, oldest first; empty when unknown.
     delta_changes: tuple[DeltaChange, ...] = ()
+    # Nonzero XOR bytes from ``staging_base`` to the target, when staged.
+    staging: Path | None = None
+    staging_base: str | None = None
 
 
 @dataclass(frozen=True)
@@ -781,6 +790,7 @@ class _LocalCheckpoint:
             shutil.rmtree(speculative_checkpoint, ignore_errors=True)
         self.store.chain_path(version.version_id).unlink(missing_ok=True)
         shutil.rmtree(self.store.delta_path(version.version_id), ignore_errors=True)
+        shutil.rmtree(self.store.staging_path(version.version_id), ignore_errors=True)
         self._set_local_checkpoint(self.store.checkpoint_path(version.base_version_id))
         self.store.write_state(
             status=CheckpointState.READY,
@@ -861,6 +871,7 @@ class _LocalCheckpoint:
             self._artifact_path(target),
             _source_identity(target),
         )
+        staging, staging_base = self._staged_from(target.version_id)
         return PreparedCheckpoint(
             target_version=target.version_id,
             path=self.local_checkpoint,
@@ -870,6 +881,8 @@ class _LocalCheckpoint:
                 "perf/mx_receive_delta_apply": 0.0,
             },
             delta_changes=delta_changes,
+            staging=staging,
+            staging_base=staging_base,
         )
 
     def _delta_changes(self, version_id: str) -> tuple[DeltaChange, ...]:
@@ -1013,6 +1026,7 @@ class _LocalCheckpoint:
             checkpoint_paths=self.checkpoint_paths,
             source=_source_identity(target),
         )
+        staging, staging_base = self._staged_from(target.version_id)
         return PreparedCheckpoint(
             target_version=target.version_id,
             path=self.local_checkpoint,
@@ -1022,6 +1036,8 @@ class _LocalCheckpoint:
                 "perf/mx_receive_delta_apply": apply_time,
             },
             delta_changes=self._delta_changes(target.version_id),
+            staging=staging,
+            staging_base=staging_base,
         )
 
     def _artifact_path(self, version: _S3Version) -> Path:
@@ -1177,6 +1193,9 @@ class _LocalCheckpoint:
         }
         target = self.store.materialized_path(version.version_id)
         apply_started = time.perf_counter()
+        sink: dict[str, tuple[int, np.ndarray, np.ndarray]] | None = (
+            {} if rl_envs.MX_REFIT_INPLACE else None
+        )
         self.store.verify_artifact(self.store.full_path(chain["full_version"]))
         for delta_version in base_chain["deltas"]:
             self.store.verify_artifact(self.store.delta_path(delta_version))
@@ -1196,7 +1215,7 @@ class _LocalCheckpoint:
             shutil.rmtree(target, ignore_errors=True)
             base_checkpoint.replace(target)
             self._set_local_checkpoint(target)
-            self._apply_delta_artifact(artifact, metadata, weight_map)
+            self._apply_delta_artifact(artifact, metadata, weight_map, sink=sink)
         else:
             # The first delta after a full checkpoint copies once so applying
             # it cannot modify the canonical full artifact.
@@ -1205,11 +1224,40 @@ class _LocalCheckpoint:
                 copy_from=base_checkpoint,
             ) as temporary:
                 self._set_local_checkpoint(temporary)
-                self._apply_delta_artifact(artifact, metadata, weight_map)
+                self._apply_delta_artifact(artifact, metadata, weight_map, sink=sink)
 
         self._set_local_checkpoint(target)
         self.store.write_chain(version.version_id, chain)
+        if sink is not None:
+            self._write_staging(version, sink)
         return download_time, time.perf_counter() - apply_started
+
+    def _write_staging(
+        self,
+        version: _S3Version,
+        tensors: dict[str, tuple[int, np.ndarray, np.ndarray]],
+    ) -> None:
+        assert version.base_version_id is not None
+        self.store.ensure_capacity(
+            sum(positions.nbytes + values.nbytes for _n, positions, values in tensors.values()),
+            protected_versions=_protected_versions(
+                self.store,
+                version.base_version_id,
+                version.version_id,
+            ),
+        )
+        with self.store.replace_directory(
+            self.store.staging_path(version.version_id)
+        ) as temporary:
+            write_staging(temporary, base_version=version.base_version_id, tensors=tensors)
+
+    def _staged_from(self, version_id: str) -> tuple[Path | None, str | None]:
+        """Return the staged delta into a version and its base, if staged."""
+        if not rl_envs.MX_REFIT_INPLACE:
+            return None, None
+        staging = self.store.staging_path(version_id)
+        base = StagedDelta.base_of(staging)
+        return (staging, base) if base is not None else (None, None)
 
     def _apply_delta_artifact(
         self,
@@ -1218,6 +1266,7 @@ class _LocalCheckpoint:
         weight_map: dict[str, str],
         *,
         verify: bool = True,
+        sink: dict[str, tuple[int, np.ndarray, np.ndarray]] | None = None,
     ) -> None:
         self.store.verify_artifact(artifact)
         shards = {
@@ -1227,7 +1276,9 @@ class _LocalCheckpoint:
             )
             for filename, names in _group_tensors_by_shard(weight_map).items()
         }
-        self._apply_shards(shards, index_metadata=index_metadata, verify=verify)
+        self._apply_shards(
+            shards, index_metadata=index_metadata, verify=verify, sink=sink
+        )
 
     def _download_deltas(
         self,
@@ -1283,6 +1334,7 @@ class _LocalCheckpoint:
         *,
         index_metadata: dict[str, Any],
         verify: bool = True,
+        sink: dict[str, tuple[int, np.ndarray, np.ndarray]] | None = None,
     ) -> None:
         if not shards:
             return
@@ -1343,12 +1395,15 @@ class _LocalCheckpoint:
                 )
                 position = 0
                 extra = b""
+                nonzero = []
                 try:
                     while position < size:
                         block = reader.read(min(2 << 20, size - position))
                         if not block:
                             break
                         delta = np.frombuffer(block, dtype=np.uint8)
+                        if sink is not None:
+                            nonzero.append(nonzero_bytes(delta, position))
                         end = position + delta.size
                         region = target[position:end]
                         try:
@@ -1367,6 +1422,8 @@ class _LocalCheckpoint:
                 # Checksums describe the delta's target, not a reverted base.
                 if verify and checksum.hexdigest() != expected_checksum:
                     raise ValueError(f"canonical target checksum differs for {name!r}")
+                if sink is not None:
+                    sink[name] = (size, *join_nonzero(size, nonzero))
 
             list(
                 threadpool_map(

@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     MX_REFIT_DELTA_WORKERS: int
     MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES: int
     MX_REFIT_METADATA_PORT: int
+    MX_REFIT_INPLACE: bool
     MX_REFIT_PREFER_PREPARED: bool
     MX_REFIT_PREFETCH: bool
     MX_REFIT_PREFETCH_POLL_SECONDS: float
@@ -225,6 +226,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_REFIT_PREFER_PREPARED": lambda: parse_bool(
         os.environ.get("MX_REFIT_PREFER_PREPARED", "false"),
         "MX_REFIT_PREFER_PREPARED",
+    ),
+    "MX_REFIT_INPLACE": lambda: parse_bool(
+        os.environ.get("MX_REFIT_INPLACE", "false"),
+        "MX_REFIT_INPLACE",
     ),
     "RANK": lambda: os.environ.get("RANK"),
 }

@@ -598,6 +598,9 @@ engine integrations.
   speculative preparation of unregistered S3 deltas.
 - `inference/engines/vllm/installer.py` owns vLLM load-layout capture and
   graph-safe installation through vLLM's layerwise reload and post-load path.
+- `inference/staging.py` owns the staged nonzero XOR bytes of a prepared delta,
+  and `inference/engines/vllm/inplace.py` installs them into live vLLM weights
+  in place by processing the delta like weights and XORing the result.
 - `inference/engines/sglang/installer.py` reloads a prepared canonical checkpoint
   through SGLang's native safetensors loader.
 
@@ -1182,6 +1185,8 @@ RL framework integrations live in the separate `modelexpress_rl` package:
 | `inference/checkpoint_store.py` | Host-local immutable lineage, locking, temporary-directory promotion, atomic JSON persistence, artifact fingerprints, and activation state |
 | `inference/receiver.py` | Canonical S3 index/shard decoding, full-checkpoint validation, and XOR reconstruction into derived checkpoints |
 | `inference/prefetch.py` | Optional background preparation of new versions outside the serving pause, plus speculative S3 deltas adopted on registration |
+| `inference/staging.py` | Staged nonzero XOR bytes of a prepared delta, memory-mapped by engine ranks |
+| `inference/engines/vllm/inplace.py` | In-place delta install: routed experts from staged bytes, other tensors through layerwise reload with XOR restore |
 | `inference/load_strategy.py` | RL cold-start policy: exact desired-version P2P, canonical S3 replay, and version-agnostic fallback when no desired version is configured |
 | `inference/version_chain.py` | Shared validation and resolution of immutable full-checkpoint and delta lineage |
 | `inference/nixl_staged_transfer.py` | Private engine-neutral exact-manifest NIXL planning, transfer, reusable destination buffers, and verification |

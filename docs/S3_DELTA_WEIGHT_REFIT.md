@@ -53,6 +53,7 @@ Environment variables used by the clients and vLLM engine:
 | `MX_REFIT_PREFETCH_POLL_SECONDS` | `2` | How often the prefetcher checks for new versions. |
 | `MX_REFIT_PREFETCH_WORKERS` | `min(8, CPU count)` | CPU workers the prefetcher uses to apply deltas while the engine serves. |
 | `MX_REFIT_PREFER_PREPARED` | `false` | Install a locally prepared target from object storage before trying a generator peer. |
+| `MX_REFIT_INPLACE` | `false` | Stage each prepared delta's nonzero XOR bytes and install the delta into live vLLM weights in place instead of reloading. See [In-place install](#in-place-install). |
 | `MX_REFIT_CHECKSUM_FORMAT` | `adler32` | Checksum algorithm written by canonical S3 trainers. |
 | `MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES` | `4294967296` (4 GiB) | Maximum tensor bytes grouped into one full-checkpoint safetensors object. |
 | `MX_S3_UPLOAD_WORKERS` | `8` | Maximum concurrent multipart uploads per trainer rank. |
@@ -685,3 +686,37 @@ sequenceDiagram
   faster than a peer transfer of the whole model.
 - The prefetcher writes its last outcome to `prefetch.json` in the model's cache
   directory. It runs at a lower CPU priority and exits with the engine process.
+
+## In-place install
+
+Even with preparation outside the pause, reloading every tensor of a large
+model through vLLM takes minutes. With `MX_REFIT_INPLACE=true`, preparing a
+delta also stages its nonzero XOR bytes per tensor under the cache's
+`staging/<version>/`. When the engine holds the delta's base, the update writes
+only those bytes into the live weights.
+
+```mermaid
+flowchart LR
+    S[(Staged nonzero bytes)] --> A[Arrange in the layer's<br/>load layout on GPU]
+    A --> P[Run the layer's own<br/>post-load processing]
+    P --> X[XOR into live storage]
+    Z[Same processing<br/>of zeros] --> X
+```
+
+- vLLM processes loaded weights by rearranging bits: sharding, fusion,
+  transposes, kernel repacking, scale permutation, and MLA's absorbed
+  `kv_b_proj` weights. Processing the delta like weights and XORing the result
+  into live storage therefore gives the same bytes as a reload of the target.
+  Processing zeros as well cancels any constant part of the processing.
+- Routed-expert layers take a batched path: each rank scatters only its shard
+  of the staged bytes into the layer's load layout, then runs the layer's
+  post-load processing once. Every other changed tensor goes through the
+  layerwise reload with the final copy replaced by an XOR.
+- Live storage keeps its addresses, so CUDA graphs stay valid.
+- The update falls back to a reload when the engine does not hold the delta's
+  base, when a layer is not supported (expert parallelism, an unexpected expert
+  tensor, or a layout mismatch), or when the staging is missing. Anything
+  already XORed belongs to a changed module, which the reload rewrites.
+- A model qualifies when its processing only rearranges bits. Check a new model,
+  quantization, or kernel backend by comparing an in-place install with a
+  reload of the same target before enabling it.
