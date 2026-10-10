@@ -31,8 +31,20 @@ from modelexpress_rl.utils import index_checkpoint_tensors
 
 logger = logging.getLogger(__name__)
 
-_EXPERT = re.compile(r"\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate|up|down)_proj\.([A-Za-z_]+)$")
-_PER_EXPERT = re.compile(r"\.mlp\.experts\.\d+\.")
+_EXPERT = re.compile(
+    r"\.layers\.(\d+)\.(?:mlp|block_sparse_moe)\.experts\.(\d+)\."
+    r"(gate_proj|up_proj|down_proj|w1|w3|w2)\.([A-Za-z_]+)$"
+)
+_PER_EXPERT = re.compile(r"\.(?:mlp|block_sparse_moe)\.experts\.\d+\.")
+# Checkpoint projection names, both the gate/up/down and the w1/w3/w2 conventions.
+_PROJECTIONS = {
+    "gate_proj": "gate",
+    "w1": "gate",
+    "up_proj": "up",
+    "w3": "up",
+    "down_proj": "down",
+    "w2": "down",
+}
 _LAYER = re.compile(r"\.layers\.(\d+)\.")
 _ARRANGED_KINDS = ("weight_packed", "weight_scale", "weight")
 _TORCH_DTYPES = {
@@ -352,7 +364,8 @@ class InPlaceInstaller:
         for name in metadata:
             match = _EXPERT.search(name)
             if match:
-                expert_names[int(match[1])][(int(match[2]), match[3], match[4])] = name
+                key = (int(match[2]), _PROJECTIONS[match[3]], match[4])
+                expert_names[int(match[1])][key] = name
         expert_layers = sorted(
             index
             for index in {layer_key(name) for name in changed if is_per_expert(name)}
@@ -411,15 +424,14 @@ class InPlaceInstaller:
         groups = {layer_key(name) for name in changed if not is_per_expert(name)}
         if not groups:
             return 0
-        from vllm.model_executor.model_loader.reload.meta import SKIP_TENSORS
-
         fed = [name for name in metadata if not is_per_expert(name) and layer_key(name) in groups]
         staged_names = set(changed)
-        # Reload leaves these tensors in place, so their loaders write live storage.
+        # Some loaders write live storage directly: tensors reload leaves in place,
+        # such as biases, and mirrors a loader keeps, such as fp32 decode copies.
+        # They then hold the loaded value rather than an XOR of it.
         originals = {
-            name: parameter.detach().clone()
-            for name, parameter in self._model.named_parameters()
-            if name.rsplit(".", 1)[-1] in SKIP_TENSORS and layer_key(name) in groups
+            name: tensor.detach().clone()
+            for name, tensor in self._live_tensors(groups).items()
         }
 
         def tensors(zero: bool) -> Iterator[tuple[str, torch.Tensor]]:
@@ -433,20 +445,36 @@ class InPlaceInstaller:
                 dtype = _TORCH_DTYPES[info["dtype"]]
                 yield name, tensor.view(dtype).view(info["shape"])
 
-        parameters = dict(self._model.named_parameters())
+        live = self._live_tensors(groups)
         self._generic_reload(lambda _aliases: self._model.load_weights(tensors(zero=True)))
-        # A direct loader overwrote the tensor with zeros; restore it and remember
-        # it, so the delta pass can XOR the original back in. A tensor that was
-        # already zero needs no correction either way.
-        direct = {}
+        # XOR the original back into every tensor the zero pass changed, after
+        # both passes. A tensor a loader overwrote then ends as original ^ delta;
+        # for one the XOR restore changed, the two extra XORs cancel.
+        changed_live = {}
         for name, original in originals.items():
-            if not torch.equal(raw_bytes(parameters[name].data), raw_bytes(original)):
-                xor_into(parameters[name].data, original)
-                direct[name] = original
+            if not torch.equal(raw_bytes(live[name].data), raw_bytes(original)):
+                xor_into(live[name].data, original)
+                changed_live[name] = original
         self._generic_reload(lambda _aliases: self._model.load_weights(tensors(zero=False)))
-        for name, original in direct.items():
-            xor_into(parameters[name].data, original)
+        for name, original in changed_live.items():
+            xor_into(live[name].data, original)
         return len(fed)
+
+    def _live_tensors(self, groups: set[int | None]) -> dict[str, torch.Tensor]:
+        """Parameters and buffers of the changed groups, except routed experts."""
+        experts = {id(module) for module in self._experts.values()}
+        found: dict[str, torch.Tensor] = {}
+        for path, module in self._model.named_modules():
+            if id(module) in experts or layer_key(path) not in groups:
+                continue
+            if any(part == "experts" for part in path.split(".")):
+                continue
+            for name, tensor in list(module.named_parameters(recurse=False)) + list(
+                module.named_buffers(recurse=False)
+            ):
+                if tensor.device.type != "meta":
+                    found.setdefault(f"{path}.{name}", tensor)
+        return found
 
 
 @contextmanager

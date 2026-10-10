@@ -345,6 +345,51 @@ def test_layers_of_other_pipeline_stages_are_skipped(monkeypatch, tmp_path):
     staged.close()
 
 
+def test_generic_install_handles_loaders_that_write_live_storage(monkeypatch, tmp_path):
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor([1, 2, 3, 4], dtype=torch.int32), requires_grad=False)
+            self.register_buffer("mirror", torch.tensor([9, 8, 7, 6], dtype=torch.int32), persistent=False)
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([Layer()])
+
+        def load_weights(self, weights):
+            layer = self.layers[0]
+            for name, tensor in weights:
+                if name.endswith("attn.weight"):
+                    # XOR restore: processed value XORed into live storage.
+                    layer.weight.data.bitwise_xor_(tensor)
+                    # A loader mirror writes the loaded value directly.
+                    layer.mirror.copy_(tensor)
+
+    monkeypatch.setattr(inplace_module, "_routed_experts_class", lambda: None)
+    model = Model()
+    installer = inplace_module.InPlaceInstaller(
+        model, device=torch.device("cpu"), generic_reload=lambda load: load(None)
+    )
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    name = "model.layers.0.attn.weight"
+    save_file({name: torch.zeros(4, dtype=torch.int32)}, checkpoint / "model.safetensors")
+    delta = torch.tensor([0, 5, 0, 1], dtype=torch.int32)
+    staged = _stage(
+        tmp_path / "staging",
+        {name: (np.zeros(16, dtype=np.uint8), delta.view(torch.uint8).numpy())},
+    )
+
+    metrics = installer._install(checkpoint, staged)
+
+    layer = model.layers[0]
+    assert metrics["perf/mx_receive_inplace_generic_tensors"] == 1
+    assert layer.weight.tolist() == [1, 2 ^ 5, 3, 4 ^ 1]
+    assert layer.mirror.tolist() == [9, 8 ^ 5, 7, 6 ^ 1]
+    staged.close()
+
+
 def test_xor_into_rejects_mismatched_storage():
     target = torch.zeros(4, dtype=torch.int32)
     inplace_module.xor_into(target, torch.ones(4, dtype=torch.int32))
