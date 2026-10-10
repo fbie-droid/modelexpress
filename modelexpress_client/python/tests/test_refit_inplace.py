@@ -325,6 +325,26 @@ def test_expert_layout_follows_the_weight_loader_rules(monkeypatch, tmp_path, tp
     staged.close()
 
 
+def test_layers_of_other_pipeline_stages_are_skipped(monkeypatch, tmp_path):
+    class PPMissingLayer(torch.nn.Module):
+        pass
+
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList([torch.nn.Module(), PPMissingLayer()])
+    monkeypatch.setattr(inplace_module, "_routed_experts_class", lambda: None)
+    installer = inplace_module.InPlaceInstaller(model, device=torch.device("cpu"), generic_reload=lambda load: None)
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    name = "model.layers.1.mlp.experts.0.gate_proj.weight"
+    save_file({name: torch.zeros(2, dtype=torch.int32)}, checkpoint / "model.safetensors")
+    staged = _stage(tmp_path / "staging", {name: (np.zeros(8, dtype=np.uint8), np.arange(8, dtype=np.uint8))})
+
+    metrics = installer._install(checkpoint, staged)
+
+    assert metrics["perf/mx_receive_inplace_expert_layers"] == 0
+    staged.close()
+
+
 def test_xor_into_rejects_mismatched_storage():
     target = torch.zeros(4, dtype=torch.int32)
     inplace_module.xor_into(target, torch.ones(4, dtype=torch.int32))

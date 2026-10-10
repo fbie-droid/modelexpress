@@ -71,6 +71,11 @@ def xor_into(target: torch.Tensor, value: torch.Tensor) -> None:
     target_bytes.bitwise_xor_(value_bytes)
 
 
+def _synchronize(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
 def layer_key(name: str) -> int | None:
     """Decoder layer index of a dotted tensor or module name, if any."""
     match = _LAYER.search(f".{name}.")
@@ -317,6 +322,12 @@ class InPlaceInstaller:
         self._device = device
         self._generic_reload = generic_reload
         self._experts = routed_expert_layers(model)
+        # Pipeline-parallel ranks hold placeholders for other stages' layers.
+        self._other_stage_layers = {
+            key
+            for path, module in model.named_modules()
+            if type(module).__name__ == "PPMissingLayer" and (key := layer_key(path)) is not None
+        }
         # Processed zeros per expert layout; None when processing maps zero to zero.
         self._zero_terms: dict[tuple, dict[str, torch.Tensor] | None] = {}
 
@@ -328,7 +339,7 @@ class InPlaceInstaller:
                 metrics = self._install(checkpoint, staged)
         finally:
             staged.close()
-        torch.cuda.synchronize(self._device)
+        _synchronize(self._device)
         metrics["perf/mx_receive_inplace_time"] = time.perf_counter() - started
         return metrics
 
@@ -342,7 +353,11 @@ class InPlaceInstaller:
             match = _EXPERT.search(name)
             if match:
                 expert_names[int(match[1])][(int(match[2]), match[3], match[4])] = name
-        expert_layers = sorted({layer_key(name) for name in changed if is_per_expert(name)})
+        expert_layers = sorted(
+            index
+            for index in {layer_key(name) for name in changed if is_per_expert(name)}
+            if index not in self._other_stage_layers
+        )
         missing = [index for index in expert_layers if index not in self._experts]
         if missing:
             raise InPlaceUnsupported(f"no routed-expert module for layers {missing[:5]}")
@@ -350,12 +365,12 @@ class InPlaceInstaller:
         expert_started = time.perf_counter()
         for index in expert_layers:
             self._install_experts(self._experts[index], staged, expert_names[index], metadata)
-        torch.cuda.synchronize(self._device)
+        _synchronize(self._device)
         expert_seconds = time.perf_counter() - expert_started
 
         generic_started = time.perf_counter()
         fed = self._install_generic(staged, changed, metadata)
-        torch.cuda.synchronize(self._device)
+        _synchronize(self._device)
         return {
             "perf/mx_receive_inplace_expert_layers": float(len(expert_layers)),
             "perf/mx_receive_inplace_expert_time": expert_seconds,
@@ -393,18 +408,18 @@ class InPlaceInstaller:
         self, staged: StagedDelta, changed: list[str], metadata: dict[str, dict]
     ) -> int:
         """Reload every tensor of each changed non-expert group with XOR restore."""
-        from vllm.model_executor.model_loader.reload.meta import SKIP_LOAD_TENSORS
-
         groups = {layer_key(name) for name in changed if not is_per_expert(name)}
         if not groups:
             return 0
+        from vllm.model_executor.model_loader.reload.meta import SKIP_TENSORS
+
         fed = [name for name in metadata if not is_per_expert(name) and layer_key(name) in groups]
         staged_names = set(changed)
-        # Loaders of these tensors bypass layerwise reload and write directly.
+        # Reload leaves these tensors in place, so their loaders write live storage.
         originals = {
             name: parameter.detach().clone()
             for name, parameter in self._model.named_parameters()
-            if name.rsplit(".", 1)[-1] in SKIP_LOAD_TENSORS and layer_key(name) in groups
+            if name.rsplit(".", 1)[-1] in SKIP_TENSORS and layer_key(name) in groups
         }
 
         def tensors(zero: bool) -> Iterator[tuple[str, torch.Tensor]]:
