@@ -333,7 +333,13 @@ def process_like_weights(
     info = get_layerwise_info(layer)
     info.kernel_tensors = get_layer_params_buffers(layer)
     info.kernel_non_persistent_buffers = set(layer._non_persistent_buffers_set)
-    bare = {name: value for name, value in vars(layer).items() if isinstance(value, torch.Tensor)}
+    # Processing rebuilds the kernel around the tensors it processes, but those
+    # hold the processed delta here. Restore the layer's and method's state so
+    # the kernel keeps reading the live storage this delta is XORed into.
+    containers = ("_parameters", "_buffers", "_modules")
+    layer_state = {name: value for name, value in vars(layer).items() if name not in containers}
+    method = layer.quant_method
+    method_state = dict(vars(method))
     try:
         restore_layer_on_meta(layer, info)
         materialize_layer(layer, info)
@@ -345,12 +351,16 @@ def process_like_weights(
                 tensor.data.zero_()
         if hasattr(layer, "_already_called_process_weights_after_loading"):
             delattr(layer, "_already_called_process_weights_after_loading")
-        layer.quant_method.process_weights_after_loading(layer)
+        method.process_weights_after_loading(layer)
         return {name: getattr(layer, name).data for name in arranged}
     finally:
         _place_kernel_tensors(layer, info)
-        for name, value in bare.items():
-            setattr(layer, name, value)
+        for name in [name for name in vars(layer) if name not in containers]:
+            if name not in layer_state:
+                delattr(layer, name)
+        vars(layer).update(layer_state)
+        vars(method).clear()
+        vars(method).update(method_state)
         info.reset()
 
 

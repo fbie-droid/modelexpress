@@ -442,6 +442,65 @@ def test_checkpoint_layers_the_model_does_not_build_are_skipped(monkeypatch, tmp
     staged.close()
 
 
+def test_processing_a_delta_leaves_the_kernel_on_live_storage(monkeypatch):
+    class Info:
+        def __init__(self):
+            self.kernel_tensors = None
+            self.kernel_non_persistent_buffers = set()
+
+        def reset(self):
+            self.kernel_tensors = None
+
+    info = Info()
+
+    def params_buffers(layer):
+        return dict(layer._parameters), dict(layer._buffers)
+
+    def restore_on_meta(layer, _info):
+        for name, param in list(layer._parameters.items()):
+            delattr(layer, name)
+            layer.register_parameter(name, torch.nn.Parameter(torch.empty_like(param), requires_grad=False))
+
+    def place(layer, info):
+        for name in list(layer._parameters):
+            delattr(layer, name)
+        for name, param in info.kernel_tensors[0].items():
+            layer.register_parameter(name, param)
+
+    modules = {
+        "vllm.model_executor.model_loader.reload.layerwise": {"_place_kernel_tensors": place, "get_layerwise_info": lambda _layer: info},
+        "vllm.model_executor.model_loader.reload.meta": {"SKIP_TENSORS": set(), "materialize_layer": lambda _l, _i: None, "restore_layer_on_meta": restore_on_meta},
+        "vllm.model_executor.model_loader.reload.utils": {"get_layer_params_buffers": params_buffers, "get_layer_tensors": lambda layer: dict(layer._parameters)},
+    }
+    for name in ("vllm", "vllm.model_executor", "vllm.model_executor.model_loader", "vllm.model_executor.model_loader.reload"):
+        monkeypatch.setitem(sys.modules, name, ModuleType(name))
+    for name, attributes in modules.items():
+        module = ModuleType(name)
+        for key, value in attributes.items():
+            setattr(module, key, value)
+        monkeypatch.setitem(sys.modules, name, module)
+
+    class Method:
+        def process_weights_after_loading(self, layer):
+            # Like a MoE kernel setup, capture the tensor being processed.
+            layer.w13_weight.data.add_(1)
+            self.kernel_weight = layer.w13_weight
+            layer.extra = "set during processing"
+
+    layer = torch.nn.Module()
+    layer.register_parameter("w13_weight", torch.nn.Parameter(torch.tensor([5, 5]), requires_grad=False))
+    layer.quant_method = Method()
+    live = layer.w13_weight
+    layer.quant_method.kernel_weight = live
+
+    processed = inplace_module.process_like_weights(layer, {"w13_weight": torch.tensor([1, 2])})
+
+    assert processed["w13_weight"].tolist() == [2, 3]
+    assert layer.w13_weight is live and live.tolist() == [5, 5]
+    assert layer.quant_method.kernel_weight is live
+    assert not hasattr(layer, "extra")
+
+
 def test_xor_into_rejects_mismatched_storage():
     target = torch.zeros(4, dtype=torch.int32)
     inplace_module.xor_into(target, torch.ones(4, dtype=torch.int32))
