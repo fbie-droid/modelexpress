@@ -312,6 +312,10 @@ def initialize_generator_runtime(
             canonical_method = CanonicalDeltaUpdateMethod(
                 model_name=engine.model_name,
                 config=object_storage,
+                stream_full_checkpoints=(
+                    rl_envs.MX_REFIT_FULL_STREAMING
+                    and engine.installer.capabilities.streamed_checkpoints
+                ),
             )
             methods.append(canonical_method)
         if any(
