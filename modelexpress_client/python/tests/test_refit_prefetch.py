@@ -406,6 +406,50 @@ def test_speculation_links_deltas_by_writer_version(tmp_path):
     assert checkpoint.store.state().version == speculative
 
 
+def test_prefetcher_indexes_the_head_it_did_not_initialize(tmp_path):
+    objects = _delta_snapshot(
+        [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
+    )
+    s3 = _FakeS3(objects)
+    _checkpoint(tmp_path, s3)
+    refit = _FakeRefit()
+    refit.add("base", payload=FULL, uri=_uri("run-v000000"), created=1)
+    # The prefetcher process attaches to a cache the engine initialized.
+    prefetcher = prefetch_module.RefitPrefetcher(
+        _settings(tmp_path, s3_watch=True),
+        service=refit,
+        s3=s3,
+        checkpoint=_checkpoint(tmp_path, s3, initialize=False),
+    )
+
+    assert prefetcher.poll_once() == receiver_module.speculative_version_id(
+        _uri("run-v000001")
+    )
+
+
+def test_prefetcher_waits_until_the_engine_activates_the_head(tmp_path):
+    objects = {
+        **_delta_snapshot(
+            [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
+        ),
+        **_delta_snapshot(
+            [1.0, 3.0], [4.0, 3.0], identity="run-v000002", base_identity="run-v000001"
+        ),
+    }
+    _s3, checkpoint, refit, prefetcher = _setup(tmp_path, objects, s3_watch=True)
+    refit.add("v1", payload=XOR, base="base", uri=_uri("run-v000001"), created=2)
+    assert prefetcher.poll_once() == "v1"
+
+    # Engine ranks may still be about to install v1 from its checkpoint.
+    assert prefetcher.poll_once() is None
+    assert checkpoint.store.state().version == "v1"
+
+    checkpoint.store.activate("v1")
+    assert prefetcher.poll_once() == receiver_module.speculative_version_id(
+        _uri("run-v000002")
+    )
+
+
 def test_prefetcher_keeps_a_speculative_head_ahead_of_its_base(tmp_path):
     objects = _delta_snapshot(
         [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"

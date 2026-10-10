@@ -38,6 +38,7 @@ from .checkpoint_store import CheckpointState, LocalCheckpointStore
 from .receiver import (
     ObjectStorageGeneratorConfig,
     PreparedCheckpoint,
+    _active_version,
     _LocalCheckpoint,
     _S3Version,
     speculative_version_id,
@@ -161,6 +162,8 @@ class RefitPrefetcher:
         state = self._store.state()
         if state is None or state.status is not CheckpointState.READY:
             return None
+        if not self._may_move_head(state.version):
+            return None
         target = self._newest_registered() if self._registry_listing else None
         if target is not None and self._should_prepare(target, head=state.version):
             chain = self._registered_chain(target, head=state.version)
@@ -200,6 +203,25 @@ class RefitPrefetcher:
             return (self._store.cache / TRIGGER_FILE).stat().st_mtime_ns
         except OSError:
             return None
+
+    def _may_move_head(self, head: str) -> bool:
+        """Whether preparing now cannot disturb an installation of the head.
+
+        Engine ranks release the cache between preparing a target and installing
+        it, and preparation may mutate a derived head in place. The head may move
+        once the engine has activated it, or when it is a speculation on top of
+        the active version, which the engine never installs under its own ID.
+        """
+        active = _active_version(self._store)
+        if active is not None and active == head:
+            return True
+        speculation = self._store.speculation()
+        return (
+            active is not None
+            and speculation is not None
+            and speculation.get("version") == head
+            and speculation.get("base_version") == active
+        )
 
     def _should_prepare(self, target: WeightVersion, *, head: str) -> bool:
         if target.version_id == head:

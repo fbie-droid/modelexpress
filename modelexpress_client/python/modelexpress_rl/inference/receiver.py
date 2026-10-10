@@ -807,7 +807,8 @@ class _LocalCheckpoint:
             raise RuntimeError("local checkpoint update is incomplete")
         active_version = _active_version(self.store) or state.version
         state_checkpoint = self.store.checkpoint_path(state.version)
-        if self.local_checkpoint != state_checkpoint:
+        # A process that attaches without initializing has indexed nothing yet.
+        if self.local_checkpoint != state_checkpoint or not self.checkpoint_paths:
             self._set_local_checkpoint(state_checkpoint)
         if state.files != checkpoint_files_state(self.checkpoint_paths):
             raise RuntimeError("local checkpoint files changed outside ModelExpress")

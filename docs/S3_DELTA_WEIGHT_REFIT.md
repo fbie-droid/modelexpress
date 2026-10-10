@@ -653,6 +653,10 @@ sequenceDiagram
   restore its base exactly, since an XOR delta is its own inverse.
 - Speculation is one delta deep and covers deltas only. Full checkpoints are
   prepared after registration.
+- Engine ranks release the cache between preparing a target and installing it,
+  and preparation can rewrite a derived checkpoint in place. The prefetcher
+  therefore moves the cache head only after the engine activates it, or when the
+  head is its own speculation on top of the active version.
 - Orchestrators may call `init_weight_transfer_engine` before every update. A
   repeated call for the same model returns at once and asks the prefetcher to
   poll. vLLM runs these calls inside its engine loop, so they never wait for
