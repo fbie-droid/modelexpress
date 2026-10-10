@@ -398,6 +398,17 @@ def test_xor_into_rejects_mismatched_storage():
         inplace_module.xor_into(target, torch.ones(3, dtype=torch.int32))
 
 
+def test_xor_into_handles_strided_live_tensors():
+    storage = torch.zeros(4, 4, dtype=torch.bfloat16)
+    target = storage.t()
+    value = torch.arange(16, dtype=torch.int16).view(torch.bfloat16).view(4, 4)
+
+    inplace_module.xor_into(target, value)
+
+    assert torch.equal(inplace_module.bits(target), inplace_module.bits(value))
+    assert torch.equal(inplace_module.bits(storage), inplace_module.bits(value).t())
+
+
 def _installer():
     return installer_module._VllmInstaller(
         model=torch.nn.Module(),

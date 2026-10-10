@@ -74,8 +74,27 @@ def raw_bytes(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.reshape(-1).view(torch.uint8)
 
 
+_SAME_SIZE_INTEGER = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+
+
+def bits(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a same-size integer view of ``tensor``, valid for any strides."""
+    integer = _SAME_SIZE_INTEGER.get(tensor.element_size())
+    if integer is None:
+        raise InPlaceUnsupported(f"cannot view {tensor.dtype} as integers")
+    return tensor.view(integer)
+
+
+def same_bits(left: torch.Tensor, right: torch.Tensor) -> bool:
+    return left.shape == right.shape and torch.equal(bits(left), bits(right))
+
+
 def xor_into(target: torch.Tensor, value: torch.Tensor) -> None:
-    """XOR the bytes of ``value`` into ``target`` in place."""
+    """XOR the bits of ``value`` into ``target`` in place."""
+    if target.shape == value.shape and target.element_size() == value.element_size():
+        bits(target).bitwise_xor_(bits(value))
+        return
+    # Processing may change the shape of a tensor but not its storage size.
     target_bytes = raw_bytes(target)
     value_bytes = value.contiguous().reshape(-1).view(torch.uint8)
     if target_bytes.numel() != value_bytes.numel():
@@ -407,7 +426,7 @@ class InPlaceInstaller:
             zeros = process_like_weights(
                 layer, {name: torch.zeros_like(tensor) for name, tensor in arranged.items()}
             )
-            nonzero = any(bool(raw_bytes(tensor.contiguous()).any()) for tensor in zeros.values())
+            nonzero = any(bool(bits(tensor).any()) for tensor in zeros.values())
             self._zero_terms[signature] = zeros if nonzero else None
         processed = process_like_weights(layer, arranged)
         zero = self._zero_terms[signature]
@@ -452,7 +471,7 @@ class InPlaceInstaller:
         # for one the XOR restore changed, the two extra XORs cancel.
         changed_live = {}
         for name, original in originals.items():
-            if not torch.equal(raw_bytes(live[name].data), raw_bytes(original)):
+            if not same_bits(live[name].data, original):
                 xor_into(live[name].data, original)
                 changed_live[name] = original
         self._generic_reload(lambda _aliases: self._model.load_weights(tensors(zero=False)))
@@ -513,6 +532,7 @@ __all__ = [
     "InPlaceInstaller",
     "InPlaceUnsupported",
     "arrange_expert_delta",
+    "bits",
     "process_like_weights",
     "raw_bytes",
     "routed_expert_layers",
