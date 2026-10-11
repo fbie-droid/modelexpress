@@ -25,7 +25,12 @@ from modelexpress_rl.inference.staging import (
     nonzero_bytes,
     write_staging,
 )
-from modelexpress_rl.utils import checksum_factory, compress_delta, compute_delta
+from modelexpress_rl.utils import (
+    checksum_factory,
+    compress_delta,
+    compute_delta,
+    index_checkpoint_tensors,
+)
 
 PREFIX = "s3://weights/hotload"
 INDEX = "model.safetensors.index.json"
@@ -57,6 +62,50 @@ def test_staged_delta_round_trips_nonzero_bytes(tmp_path):
     assert tensor.values.tolist() == [5, 9]
     assert staged.tensor("b").positions.size == 0
     staged.close()
+
+
+def test_staged_base_is_read_without_the_index(tmp_path):
+    staged = _stage(
+        tmp_path / "staging",
+        {"a": (np.zeros(4, dtype=np.uint8), np.arange(4, dtype=np.uint8))},
+        base="v7",
+    )
+    staged.close()
+    (tmp_path / "staging" / "index.json").unlink()
+
+    assert StagedDelta.base_of(tmp_path / "staging") == "v7"
+
+
+def test_staging_rejects_offsets_of_the_wrong_width(tmp_path):
+    tensors = {"a": (4, np.arange(2, dtype=np.uint64), np.ones(2, dtype=np.uint8))}
+
+    with pytest.raises(ValueError, match="offsets"):
+        write_staging(tmp_path, base_version="base", tensors=tensors)
+
+
+def test_checkpoint_index_reuses_unchanged_headers(tmp_path):
+    first, second = tmp_path / "v1", tmp_path / "v2"
+    for directory in (first, second):
+        directory.mkdir()
+        save_file({"a": torch.zeros(2), "lm_head.weight": torch.ones(3)}, directory / "model.safetensors")
+
+    _, locations, metadata = index_checkpoint_tensors(first)
+    _, again, same = index_checkpoint_tensors(first)
+    _, moved, reused = index_checkpoint_tensors(second)
+
+    assert same is metadata and again is locations
+    # A new version directory with the same headers keeps the parsed metadata.
+    assert reused is metadata
+    assert moved["a"] == (second / "model.safetensors", *locations["a"][1:])
+
+    (second / "config.json").write_text(json.dumps({"tie_word_embeddings": True}))
+    _, _, tied = index_checkpoint_tensors(second)
+    assert "lm_head.weight" not in tied and "lm_head.weight" in metadata
+
+    save_file({"a": torch.zeros(4)}, second / "model.safetensors")
+    _, changed, fresh = index_checkpoint_tensors(second)
+    assert fresh is not metadata and fresh["a"]["shape"] == [4]
+    assert list(changed) == ["a"]
 
 
 def test_large_tensors_stage_wide_offsets():
@@ -440,6 +489,39 @@ def test_checkpoint_layers_the_model_does_not_build_are_skipped(monkeypatch, tmp
     assert metrics["perf/mx_receive_inplace_expert_layers"] == 0
     assert metrics["perf/mx_receive_inplace_generic_tensors"] == 0
     staged.close()
+
+
+def test_unrecognized_expert_tensors_are_not_installed_in_place(monkeypatch, tmp_path):
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList([torch.nn.Module()])
+    monkeypatch.setattr(inplace_module, "_routed_experts_class", lambda: None)
+    installer = inplace_module.InPlaceInstaller(model, device=torch.device("cpu"), generic_reload=lambda load: None)
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    name = "model.layers.0.mlp.experts.0.gate_proj.weight_scale_2"
+    save_file({name: torch.zeros(2, dtype=torch.int32)}, checkpoint / "model.safetensors")
+    staged = _stage(tmp_path / "staging", {name: (np.zeros(8, dtype=np.uint8), np.arange(8, dtype=np.uint8))})
+
+    with pytest.raises(inplace_module.InPlaceUnsupported, match="unrecognized"):
+        installer._install(checkpoint, staged)
+    staged.close()
+
+
+def test_checkpoint_catalog_groups_names_by_layer():
+    names = [
+        "model.embed_tokens.weight",
+        "model.layers.3.mlp.experts.1.down_proj.weight_packed",
+        "model.layers.3.self_attn.o_proj.weight",
+        "model.layers.3.mlp.experts.0.w9.weight",
+    ]
+
+    catalog = inplace_module.CheckpointCatalog.of({name: {} for name in names})
+
+    assert catalog.layers == {names[0]: None, names[1]: 3, names[2]: 3, names[3]: 3}
+    assert catalog.experts == {3: {(1, "down", "weight_packed"): names[1]}}
+    assert catalog.per_expert == {names[1], names[3]}
+    assert catalog.unmatched_experts == {names[3]}
+    assert catalog.generic == (names[0], names[2])
 
 
 def test_processing_a_delta_leaves_the_kernel_on_live_storage(monkeypatch):

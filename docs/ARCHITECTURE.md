@@ -1271,7 +1271,9 @@ WeightVersions through `ModelExpressTrainerClient`. After a successful apply,
 the bridge merges staging
 and installation metrics and logs each numeric `perf/` phase as a separate INFO
 line in deterministic key order. `perf/mx_receive_stage_weight_time` covers the
-complete `ModelExpressGeneratorClient.stage_weight()` wall-clock call.
+complete `ModelExpressGeneratorClient.stage_weight()` wall-clock call, and
+`perf/mx_receive_prepare_time` the part of it spent preparing an object-storage
+checkpoint.
 
 `engines/vllm/refit/MdlLoader` implements Mapped Direct Load (MDL) for tensors that have already
 been translated into the inference model's naming and numerical format. The

@@ -18,9 +18,15 @@ from pathlib import Path
 import numpy as np
 
 INDEX_FILE = "index.json"
+BASE_FILE = "base.json"
 POSITIONS_FILE = "positions.bin"
 VALUES_FILE = "values.bin"
 _UINT32_LIMIT = 1 << 32
+
+
+def position_dtype(nbytes: int) -> np.dtype:
+    """Narrowest offset type for a tensor of ``nbytes`` bytes."""
+    return np.dtype(np.uint32 if nbytes <= _UINT32_LIMIT else np.uint64)
 
 
 def nonzero_bytes(block: np.ndarray, offset: int) -> tuple[np.ndarray, np.ndarray]:
@@ -33,7 +39,7 @@ def join_nonzero(
     nbytes: int, parts: list[tuple[np.ndarray, np.ndarray]]
 ) -> tuple[np.ndarray, np.ndarray]:
     """Concatenate block results in order, with the narrowest offset type."""
-    dtype = np.uint32 if nbytes <= _UINT32_LIMIT else np.uint64
+    dtype = position_dtype(nbytes)
     if not parts:
         return np.empty(0, dtype=dtype), np.empty(0, dtype=np.uint8)
     positions = np.concatenate([part[0] for part in parts]).astype(dtype, copy=False)
@@ -48,29 +54,27 @@ def write_staging(
     tensors: dict[str, tuple[int, np.ndarray, np.ndarray]],
 ) -> None:
     """Write tensors as {name: (tensor bytes, offsets, values)} into ``directory``."""
-    entries = {}
-    position_offset = value_offset = 0
+    names = sorted(tensors)
+    sizes, counts = [], []
     with (directory / POSITIONS_FILE).open("wb") as positions_file, (
         directory / VALUES_FILE
     ).open("wb") as values_file:
-        for name in sorted(tensors):
+        for name in names:
             nbytes, positions, values = tensors[name]
             if positions.size != values.size:
                 raise ValueError(f"staged delta {name!r} has mismatched lengths")
+            if positions.dtype != position_dtype(nbytes):
+                raise ValueError(f"staged delta {name!r} has {positions.dtype} offsets")
             positions_file.write(positions.tobytes())
             values_file.write(values.tobytes())
-            entries[name] = {
-                "nbytes": nbytes,
-                "count": int(values.size),
-                "position_dtype": positions.dtype.name,
-                "position_offset": position_offset,
-                "value_offset": value_offset,
-            }
-            position_offset += positions.nbytes
-            value_offset += values.nbytes
+            sizes.append(nbytes)
+            counts.append(int(values.size))
+    # Parallel lists parse much faster than one record per tensor, and offsets
+    # follow from the counts. The base is separate so checking it reads no index.
     (directory / INDEX_FILE).write_text(
-        json.dumps({"base_version": base_version, "tensors": entries}, sort_keys=True)
+        json.dumps({"names": names, "nbytes": sizes, "counts": counts})
     )
+    (directory / BASE_FILE).write_text(json.dumps({"base_version": base_version}))
 
 
 @dataclass(frozen=True)
@@ -85,8 +89,16 @@ class StagedDelta:
 
     def __init__(self, directory: Path) -> None:
         index = json.loads((directory / INDEX_FILE).read_text())
-        self.base_version: str = index["base_version"]
-        self._entries: dict[str, dict] = index["tensors"]
+        self.base_version: str = json.loads((directory / BASE_FILE).read_text())[
+            "base_version"
+        ]
+        self._names: list[str] = index["names"]
+        self._rows = {name: row for row, name in enumerate(self._names)}
+        self._nbytes = np.asarray(index["nbytes"], dtype=np.int64)
+        self._counts = np.asarray(index["counts"], dtype=np.int64)
+        itemsizes = np.where(self._nbytes <= _UINT32_LIMIT, 4, 8)
+        self._position_offsets = _starts(self._counts * itemsizes)
+        self._value_offsets = _starts(self._counts)
         self._maps = []
         self._positions = self._map(directory / POSITIONS_FILE)
         self._values = self._map(directory / VALUES_FILE)
@@ -103,26 +115,30 @@ class StagedDelta:
     def base_of(directory: Path) -> str | None:
         """Return the base version a staged delta applies to, if it exists."""
         try:
-            return json.loads((directory / INDEX_FILE).read_text())["base_version"]
+            return json.loads((directory / BASE_FILE).read_text())["base_version"]
         except (OSError, ValueError, KeyError):
             return None
 
     def names(self) -> list[str]:
-        return list(self._entries)
+        return list(self._names)
 
     def __contains__(self, name: object) -> bool:
-        return name in self._entries
+        return name in self._rows
 
     def tensor(self, name: str) -> StagedTensor:
-        entry = self._entries[name]
-        dtype = np.dtype(entry["position_dtype"])
+        row = self._rows[name]
+        nbytes = int(self._nbytes[row])
+        count = int(self._counts[row])
         positions = np.frombuffer(
-            self._positions, dtype=dtype, count=entry["count"], offset=entry["position_offset"]
+            self._positions,
+            dtype=position_dtype(nbytes),
+            count=count,
+            offset=int(self._position_offsets[row]),
         )
         values = np.frombuffer(
-            self._values, dtype=np.uint8, count=entry["count"], offset=entry["value_offset"]
+            self._values, dtype=np.uint8, count=count, offset=int(self._value_offsets[row])
         )
-        return StagedTensor(entry["nbytes"], positions, values)
+        return StagedTensor(nbytes, positions, values)
 
     def close(self) -> None:
         """Unmap the files once no array still views them."""
@@ -136,10 +152,16 @@ class StagedDelta:
         self._maps.clear()
 
 
+def _starts(sizes: np.ndarray) -> np.ndarray:
+    """Offset of each item when items of ``sizes`` are laid out back to back."""
+    return np.concatenate(([0], np.cumsum(sizes)[:-1])).astype(np.int64)
+
+
 __all__ = [
     "StagedDelta",
     "StagedTensor",
     "join_nonzero",
     "nonzero_bytes",
+    "position_dtype",
     "write_staging",
 ]

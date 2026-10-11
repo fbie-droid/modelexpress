@@ -20,6 +20,7 @@ import warnings
 from collections import defaultdict
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -364,6 +365,38 @@ def process_like_weights(
         info.reset()
 
 
+@dataclass(frozen=True)
+class CheckpointCatalog:
+    """A checkpoint's tensor names by decoder layer, built once per layout."""
+
+    layers: dict[str, int | None]
+    experts: dict[int, dict[tuple[int, str, str], str]]
+    per_expert: frozenset[str]
+    # Per-expert tensors whose projection or kind is not recognized.
+    unmatched_experts: frozenset[str]
+    # Every other tensor, in checkpoint order.
+    generic: tuple[str, ...]
+
+    @classmethod
+    def of(cls, metadata: dict[str, dict]) -> CheckpointCatalog:
+        layers: dict[str, int | None] = {}
+        experts: dict[int, dict[tuple[int, str, str], str]] = defaultdict(dict)
+        per_expert, unmatched, generic = set(), set(), []
+        for name in metadata:
+            layers[name] = layer_key(name)
+            if not is_per_expert(name):
+                generic.append(name)
+                continue
+            per_expert.add(name)
+            match = _EXPERT.search(name)
+            if match is None:
+                unmatched.add(name)
+                continue
+            key = (int(match[2]), _PROJECTIONS[match[3]], match[4])
+            experts[int(match[1])][key] = name
+        return cls(layers, dict(experts), frozenset(per_expert), frozenset(unmatched), tuple(generic))
+
+
 class InPlaceInstaller:
     """Install staged deltas into one rank's live model."""
 
@@ -387,6 +420,7 @@ class InPlaceInstaller:
         }
         # Processed zeros per expert layout; None when processing maps zero to zero.
         self._zero_terms: dict[tuple, dict[str, torch.Tensor] | None] = {}
+        self._catalog: tuple[dict[str, dict], CheckpointCatalog] | None = None
 
     def install(self, checkpoint: str | Path, staging: Path) -> dict[str, float]:
         started = time.perf_counter()
@@ -401,39 +435,50 @@ class InPlaceInstaller:
         return metrics
 
     def _install(self, checkpoint: str | Path, staged: StagedDelta) -> dict[str, float]:
+        index_started = time.perf_counter()
         _paths, _locations, metadata = index_checkpoint_tensors(checkpoint)
-        if any(name not in metadata for name in staged.names()):
+        catalog = self._catalog_for(metadata)
+        names = staged.names()
+        if any(name not in metadata for name in names):
             raise InPlaceUnsupported("staged tensors are missing from the checkpoint")
-        changed = [name for name in staged.names() if self._served(name)]
-        expert_names: dict[int, dict[tuple[int, str, str], str]] = defaultdict(dict)
-        for name in metadata:
-            match = _EXPERT.search(name)
-            if match:
-                key = (int(match[2]), _PROJECTIONS[match[3]], match[4])
-                expert_names[int(match[1])][key] = name
-        expert_layers = sorted({layer_key(name) for name in changed if is_per_expert(name)})
+        changed = [name for name in names if self._served(catalog.layers[name])]
+        unmatched = [name for name in changed if name in catalog.unmatched_experts]
+        if unmatched:
+            raise InPlaceUnsupported(f"unrecognized expert tensors {unmatched[:3]}")
+        expert_layers = sorted(
+            {catalog.layers[name] for name in changed if name in catalog.per_expert}
+        )
         missing = [index for index in expert_layers if index not in self._experts]
         if missing:
             raise InPlaceUnsupported(f"no routed-expert module for layers {missing[:5]}")
+        index_seconds = time.perf_counter() - index_started
 
         expert_started = time.perf_counter()
         for index in expert_layers:
-            self._install_experts(self._experts[index], staged, expert_names[index], metadata)
+            self._install_experts(
+                self._experts[index], staged, catalog.experts.get(index, {}), metadata
+            )
         _synchronize(self._device)
         expert_seconds = time.perf_counter() - expert_started
 
         generic_started = time.perf_counter()
-        fed = self._install_generic(staged, changed, metadata)
+        fed = self._install_generic(staged, changed, catalog, metadata)
         _synchronize(self._device)
         return {
+            "perf/mx_receive_inplace_index_time": index_seconds,
             "perf/mx_receive_inplace_expert_layers": float(len(expert_layers)),
             "perf/mx_receive_inplace_expert_time": expert_seconds,
             "perf/mx_receive_inplace_generic_tensors": float(fed),
             "perf/mx_receive_inplace_generic_time": time.perf_counter() - generic_started,
         }
 
-    def _served(self, name: str) -> bool:
-        key = layer_key(name)
+    def _catalog_for(self, metadata: dict[str, dict]) -> CheckpointCatalog:
+        # The checkpoint index returns the same metadata while headers are unchanged.
+        if self._catalog is None or self._catalog[0] is not metadata:
+            self._catalog = (metadata, CheckpointCatalog.of(metadata))
+        return self._catalog[1]
+
+    def _served(self, key: int | None) -> bool:
         return key is None or key in self._served_layers
 
     def _install_experts(
@@ -463,17 +508,24 @@ class InPlaceInstaller:
                 xor_into(live, zero[name])
 
     def _install_generic(
-        self, staged: StagedDelta, changed: list[str], metadata: dict[str, dict]
+        self,
+        staged: StagedDelta,
+        changed: list[str],
+        catalog: CheckpointCatalog,
+        metadata: dict[str, dict],
     ) -> int:
         """Reload every tensor of each changed non-expert group with XOR restore."""
-        groups = {layer_key(name) for name in changed if not is_per_expert(name)}
+        groups = {catalog.layers[name] for name in changed if name not in catalog.per_expert}
         if not groups:
             return 0
         fed = [
             name
-            for name in metadata
-            if not is_per_expert(name) and layer_key(name) in groups and self._served(name)
+            for name in catalog.generic
+            if catalog.layers[name] in groups and self._served(catalog.layers[name])
         ]
+        unknown = sorted({metadata[name]["dtype"] for name in fed} - _TORCH_DTYPES.keys())
+        if unknown:
+            raise InPlaceUnsupported(f"unsupported checkpoint dtypes {unknown}")
         staged_names = set(changed)
         # Some loaders write live storage directly: tensors reload leaves in place,
         # such as biases, and mirrors a loader keeps, such as fp32 decode copies.
@@ -559,6 +611,7 @@ def xor_restore() -> Iterator[None]:
 
 
 __all__ = [
+    "CheckpointCatalog",
     "InPlaceInstaller",
     "InPlaceUnsupported",
     "arrange_expert_delta",

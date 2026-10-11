@@ -713,6 +713,10 @@ flowchart LR
   post-load processing once. Every other changed tensor goes through the
   layerwise reload with the final copy replaced by an XOR.
 - Live storage keeps its addresses, so CUDA graphs stay valid.
+- Checkpoint headers are parsed once per process. Deltas never change them, so
+  each update reuses the previous index. `perf/mx_receive_inplace_index_time`,
+  `perf/mx_receive_inplace_expert_time`, and `perf/mx_receive_inplace_generic_time`
+  split the install.
 - After the engine starts, it holds `initial_serving_version_id` when the
   orchestrator passes one, and otherwise `initial_base_version_id`. The first
   delta from that version installs in place, or surgically, without a full

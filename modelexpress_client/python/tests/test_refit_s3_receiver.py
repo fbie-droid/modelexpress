@@ -1173,6 +1173,7 @@ def test_canonical_s3_prepares_then_installs_one_global_index(monkeypatch, tmp_p
         "s3://weights/test/v1/model-00000-of-00001.safetensors",
     ]
     assert staged.metrics["perf/mx_receive_delta_download"] >= 0
+    assert staged.metrics["perf/mx_receive_prepare_time"] >= 0
     assert adapter.apply_weight(staged)["perf/mx_receive_install_time"] >= 0
     assert adapter.installed == [staged.path]
     adapter.release_staged_weight(staged)

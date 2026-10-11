@@ -181,7 +181,11 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
                     checkpoint.initialize()
                     self._checkpoint = checkpoint
                     self._initialized = True
+                started = time.perf_counter()
                 checkpoint = self._checkpoint.prepare_chain(tuple(versions))
+                checkpoint.metrics["perf/mx_receive_prepare_time"] = (
+                    time.perf_counter() - started
+                )
         except ValueError as error:
             raise RuntimeError(str(error)) from error
         self._active = PreparedCheckpointArtifact(checkpoint=checkpoint)
