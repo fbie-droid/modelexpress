@@ -108,6 +108,30 @@ def test_checkpoint_index_reuses_unchanged_headers(tmp_path):
     assert list(changed) == ["a"]
 
 
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "mps",
+            marks=pytest.mark.skipif(not torch.backends.mps.is_available(), reason="no MPS"),
+        ),
+    ],
+)
+def test_staged_bytes_rebuild_the_dense_delta(tmp_path, device):
+    after = np.random.default_rng(1).integers(0, 256, 64, dtype=np.uint8)
+    after[::3] = 0
+    staged = _stage(tmp_path / "staging", {"a": (np.zeros(64, dtype=np.uint8), after)})
+
+    with inplace_module._quiet_readonly_buffers():
+        data = inplace_module.staged_bytes(64, staged.tensor("a"), torch.device(device), chunk=5)
+
+    assert data.device.type == device
+    assert data.cpu().numpy().tolist() == after.tolist()
+    assert not inplace_module.staged_bytes(8, None, torch.device(device)).any()
+    staged.close()
+
+
 def test_large_tensors_stage_wide_offsets():
     small, _ = join_nonzero(16, [(np.array([3]), np.array([1], dtype=np.uint8))])
     large, _ = join_nonzero(1 << 33, [(np.array([1 << 32]), np.array([1], dtype=np.uint8))])

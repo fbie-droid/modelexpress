@@ -27,7 +27,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from modelexpress_rl.inference.staging import StagedDelta
+from modelexpress_rl.inference.staging import StagedDelta, StagedTensor
 from modelexpress_rl.utils import index_checkpoint_tensors
 
 logger = logging.getLogger(__name__)
@@ -125,6 +125,35 @@ def _quiet_readonly_buffers() -> Iterator[None]:
         yield
 
 
+def device_offsets(positions: np.ndarray, device: torch.device) -> torch.Tensor:
+    """Staged byte offsets as int64 on ``device``, sent at their stored width."""
+    if positions.dtype == np.uint32:
+        return torch.from_numpy(positions.view(np.int32)).to(device).to(torch.int64) & 0xFFFFFFFF
+    return torch.from_numpy(positions.view(np.int64)).to(device)
+
+
+def staged_bytes(
+    nbytes: int,
+    staged: StagedTensor | None,
+    device: torch.device,
+    *,
+    chunk: int = 1 << 24,
+) -> torch.Tensor:
+    """A tensor's full XOR delta as bytes on ``device``; zeros when unstaged."""
+    if device.type == "cpu":
+        # Untouched pages of a zeroed host array stay unallocated.
+        data = np.zeros(nbytes, dtype=np.uint8)
+        if staged is not None:
+            data[staged.positions.astype(np.intp, copy=False)] = staged.values
+        return torch.from_numpy(data)
+    data = torch.zeros(nbytes, dtype=torch.uint8, device=device)
+    if staged is not None:
+        for start in range(0, staged.positions.size, chunk):
+            offsets = device_offsets(staged.positions[start : start + chunk], device)
+            data[offsets] = torch.from_numpy(staged.values[start : start + chunk]).to(device)
+    return data
+
+
 def shard_nonzero(
     positions: np.ndarray,
     *,
@@ -189,11 +218,7 @@ def scatter_expert_shards(
     if not positions:
         return
     device = scratch.device
-    joined = np.concatenate(positions)
-    if joined.dtype == np.uint32:
-        offset = torch.from_numpy(joined.view(np.int32)).to(device).to(torch.int64) & 0xFFFFFFFF
-    else:
-        offset = torch.from_numpy(joined.view(np.int64)).to(device)
+    offset = device_offsets(np.concatenate(positions), device)
     value = torch.from_numpy(np.concatenate(values)).to(device)
     repeat = torch.tensor(counts, device=device)
     expert = torch.repeat_interleave(torch.tensor(experts, device=device), repeat)
@@ -538,13 +563,9 @@ class InPlaceInstaller:
         def tensors(zero: bool) -> Iterator[tuple[str, torch.Tensor]]:
             for name in fed:
                 info = metadata[name]
-                data = np.zeros(info["byte_size"], dtype=np.uint8)
-                if not zero and name in staged_names:
-                    staged_tensor = staged.tensor(name)
-                    data[staged_tensor.positions.astype(np.int64)] = staged_tensor.values
-                tensor = torch.from_numpy(data)
-                dtype = _TORCH_DTYPES[info["dtype"]]
-                yield name, tensor.view(dtype).view(info["shape"])
+                delta = None if zero or name not in staged_names else staged.tensor(name)
+                data = staged_bytes(info["byte_size"], delta, self._input_device(info["byte_size"]))
+                yield name, data.view(_TORCH_DTYPES[info["dtype"]]).view(info["shape"])
 
         live = self._live_tensors(groups)
         self._generic_reload(lambda _aliases: self._model.load_weights(tensors(zero=True)))
@@ -560,6 +581,19 @@ class InPlaceInstaller:
         for name, original in changed_live.items():
             xor_into(live[name].data, original)
         return len(fed)
+
+    def _input_device(self, nbytes: int) -> torch.device:
+        """Build a reload input on the GPU when it has room to spare, else on the host.
+
+        Host inputs cost page faults and a host-to-device copy of every byte.
+        """
+        if self._device.type != "cuda":
+            return torch.device("cpu")
+        free, _total = torch.cuda.mem_get_info(self._device)
+        cached = torch.cuda.memory_reserved(self._device) - torch.cuda.memory_allocated(
+            self._device
+        )
+        return self._device if free + cached > 2 * nbytes + (1 << 30) else torch.device("cpu")
 
     def _live_tensors(self, groups: set[int | None]) -> dict[str, torch.Tensor]:
         """Parameters and buffers of the changed groups, except routed experts."""
@@ -621,6 +655,7 @@ __all__ = [
     "routed_expert_layers",
     "scatter_expert_shards",
     "shard_nonzero",
+    "staged_bytes",
     "xor_into",
     "xor_restore",
 ]

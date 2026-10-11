@@ -711,7 +711,8 @@ flowchart LR
 - Routed-expert layers take a batched path: each rank scatters only its shard
   of the staged bytes into the layer's load layout, then runs the layer's
   post-load processing once. Every other changed tensor goes through the
-  layerwise reload with the final copy replaced by an XOR.
+  layerwise reload with the final copy replaced by an XOR. That reload's inputs
+  are built on the GPU when it has room, rather than as host arrays.
 - Live storage keeps its addresses, so CUDA graphs stay valid.
 - Checkpoint headers are parsed once per process. Deltas never change them, so
   each update reuses the previous index. `perf/mx_receive_inplace_index_time`,
