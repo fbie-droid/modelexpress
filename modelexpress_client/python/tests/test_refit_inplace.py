@@ -639,7 +639,7 @@ class _InPlace:
     calls = []
     error = None
 
-    def __init__(self, model, *, device, generic_reload):
+    def __init__(self, model, *, device, generic_reload, capture_layout, refresh_attention, agree):
         pass
 
     def install(self, path, staging):
@@ -704,3 +704,266 @@ def test_in_place_install_is_opt_in(staged_checkpoint, monkeypatch):
 
     assert installer._install_in_place(staged_checkpoint, live_version="v1") is None
     assert _InPlace.calls == []
+
+
+def _recorded(source, param, shape, *, ops=(), offset=0, stride=None, dtype=torch.int32):
+    from modelexpress.refit.reshard.types import RecordedCopy
+
+    if stride is None:
+        stride = tuple(torch.empty(shape).stride())
+    return RecordedCopy(
+        src_name=source,
+        op_chain=tuple(ops),
+        param_name=param,
+        dest_offset=offset,
+        dest_shape=tuple(shape),
+        dest_stride=tuple(stride),
+        dest_dtype=dtype,
+    )
+
+
+def test_direct_copies_place_shards_like_the_loader(tmp_path):
+    from modelexpress.refit.reshard.types import CaptureResult
+
+    generator = torch.Generator().manual_seed(5)
+    q = torch.randint(-(2**31), 2**31 - 1, (6, 4), generator=generator, dtype=torch.int32)
+    k = torch.randint(-(2**31), 2**31 - 1, (2, 4), generator=generator, dtype=torch.int32)
+    o = torch.randint(-(2**31), 2**31 - 1, (4, 6), generator=generator, dtype=torch.int32)
+    deltas = {"q": q, "k": k, "o": o}
+    staged = _stage(
+        tmp_path / "staging",
+        {name: (np.zeros(value.numel() * 4, dtype=np.uint8), value.reshape(-1).view(torch.uint8).numpy()) for name, value in deltas.items()},
+    )
+    # Rank 1 of 2: q and k fuse into one column shard, o takes a row shard.
+    qkv = torch.zeros(4, 4, dtype=torch.int32)
+    o_shard = torch.zeros(4, 3, dtype=torch.int32)
+    capture = CaptureResult(
+        copies=[
+            _recorded("q", "qkv", (3, 4), ops=[("narrow", (0, 3, 3), ())]),
+            _recorded("k", "qkv", (1, 4), ops=[("narrow", (0, 1, 1), ())], offset=12),
+            _recorded("o", "o", (4, 3), ops=[("narrow", (1, 3, 3), ())]),
+        ]
+    )
+    metadata = {name: {"shape": list(value.shape), "dtype": "I32"} for name, value in deltas.items()}
+    params = {"qkv": qkv, "o": o_shard}
+    layout = {name: (tuple(value.shape), value.dtype) for name, value in params.items()}
+
+    plan = inplace_module.direct_copies(capture, layout, metadata, params, excluded=set())
+    with inplace_module._quiet_readonly_buffers():
+        for name, copies in plan.items():
+            for copy in copies:
+                inplace_module.xor_direct(
+                    params[copy.param], staged.tensor(name), copy, shape=metadata[name]["shape"], dtype=torch.int32
+                )
+
+    assert torch.equal(qkv, torch.cat([q[3:6], k[1:2]]))
+    assert torch.equal(o_shard, o[:, 3:6])
+    excluded = inplace_module.direct_copies(capture, layout, metadata, params, excluded={"o"})
+    assert set(excluded) == {"q", "k"}
+    staged.close()
+
+
+class _DirectLayer(torch.nn.Module):
+    def __init__(self, mirror):
+        super().__init__()
+        self.proj = torch.nn.Module()
+        self.proj.register_parameter("weight", torch.nn.Parameter(torch.arange(6, dtype=torch.int32).view(2, 3), requires_grad=False))
+        self.attn = _DirectAttention(self.proj)
+        self.mirror = mirror
+        self.register_buffer("copy", torch.full((2, 3), 7, dtype=torch.int32), persistent=False)
+
+
+class _DirectAttention(torch.nn.Module):
+    def __init__(self, proj):
+        super().__init__()
+        self.source = [proj]
+        self.register_buffer("derived", proj.weight.detach() * 2, persistent=False)
+
+    def process_weights_after_loading(self, _dtype):
+        self.derived.copy_(self.source[0].weight * 2)
+
+
+class _DirectModel(torch.nn.Module):
+    NAME = "model.layers.0.proj.weight"
+    FROZEN = "model.layers.0.frozen.bias"
+
+    def __init__(self, mirror=False, live_written=False):
+        super().__init__()
+        self.layers = torch.nn.ModuleList([_DirectLayer(mirror)])
+        frozen = torch.nn.Module()
+        frozen.register_parameter("bias", torch.nn.Parameter(torch.tensor([3, 4], dtype=torch.int32), requires_grad=False))
+        self.layers[0].frozen = frozen
+        self.live_written = live_written
+        self.reloads = 0
+
+    def load_weights(self, weights):
+        layer = self.layers[0]
+        for name, tensor in weights:
+            if name == self.FROZEN:
+                # A bias a loader writes in place; unchanged deltas write zeros.
+                layer.frozen.bias.data.copy_(tensor)
+            if name != self.NAME:
+                continue
+            if self.live_written:
+                # Like a bias, which reload leaves in place for its loader to write.
+                layer.proj.weight.data.copy_(tensor)
+            else:
+                # XOR restore of an unprocessed layer.
+                layer.proj.weight.data.bitwise_xor_(tensor)
+            if layer.mirror:
+                layer.copy.copy_(tensor)
+
+
+def _direct_installer(monkeypatch, model):
+    from modelexpress.refit.reshard.types import CaptureResult
+
+    monkeypatch.setattr(inplace_module, "_routed_experts_class", lambda: None)
+    monkeypatch.setattr(inplace_module, "_is_deferred_attention", lambda module: isinstance(module, _DirectAttention))
+    monkeypatch.setenv("MX_REFIT_INPLACE_DIRECT", "true")
+
+    def reload(load):
+        model.reloads += 1
+        load(None)
+        # vLLM's finalize reruns deferred attention processing.
+        model.layers[0].attn.process_weights_after_loading(None)
+
+    def capture(manifest):
+        assert [name for name, _dtype, _shape in manifest] == [model.NAME]
+        param = "layers.0.proj.weight"
+        return CaptureResult(copies=[_recorded(model.NAME, param, (2, 3))]), {param: ((2, 3), torch.int32)}
+
+    def refresh(layers):
+        for layer in layers:
+            layer.process_weights_after_loading(None)
+
+    return inplace_module.InPlaceInstaller(
+        model, device=torch.device("cpu"), generic_reload=reload, capture_layout=capture, refresh_attention=refresh
+    )
+
+
+def _direct_update(tmp_path, installer, step, delta):
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir(exist_ok=True)
+    save_file(
+        {_DirectModel.NAME: torch.zeros(2, 3, dtype=torch.int32), _DirectModel.FROZEN: torch.zeros(2, dtype=torch.int32)},
+        checkpoint / "model.safetensors",
+    )
+    staged = _stage(
+        tmp_path / f"staging{step}",
+        {_DirectModel.NAME: (np.zeros(24, dtype=np.uint8), delta.reshape(-1).view(torch.uint8).numpy())},
+    )
+    with inplace_module._quiet_readonly_buffers():
+        metrics = installer._install(checkpoint, staged)
+    staged.close()
+    return metrics
+
+
+@pytest.mark.parametrize("live_written", [False, True])
+def test_verified_tensors_install_by_direct_xor(monkeypatch, tmp_path, live_written):
+    model = _DirectModel(live_written=live_written)
+    installer = _direct_installer(monkeypatch, model)
+    first = torch.tensor([[1, 0, 2], [0, 3, 0]], dtype=torch.int32)
+    second = torch.tensor([[0, 4, 0], [5, 0, 6]], dtype=torch.int32)
+    weight = model.layers[0].proj.weight
+
+    reloaded = _direct_update(tmp_path, installer, 1, first)
+    direct = _direct_update(tmp_path, installer, 2, second)
+
+    # The reload feeds the whole layer, including the unchanged bias.
+    assert reloaded["perf/mx_receive_inplace_generic_tensors"] == 2
+    # Peers agree on what each rank verified at the start of the next install.
+    assert reloaded["perf/mx_receive_inplace_verified_tensors"] == 0
+    assert direct["perf/mx_receive_inplace_verified_tensors"] == 1
+    assert direct["perf/mx_receive_inplace_direct_tensors"] == 1
+    assert direct["perf/mx_receive_inplace_generic_tensors"] == 0
+    assert model.reloads == 2
+    expected = torch.arange(6, dtype=torch.int32).view(2, 3) ^ first ^ second
+    assert torch.equal(weight, expected)
+    assert torch.equal(model.layers[0].attn.derived, expected * 2)
+    assert model.layers[0].frozen.bias.tolist() == [3, 4]
+
+
+def test_tensors_with_a_loader_mirror_keep_reloading(monkeypatch, tmp_path):
+    model = _DirectModel(mirror=True)
+    installer = _direct_installer(monkeypatch, model)
+    first = torch.tensor([[1, 0, 2], [0, 3, 0]], dtype=torch.int32)
+    second = torch.tensor([[0, 4, 0], [5, 0, 6]], dtype=torch.int32)
+
+    _direct_update(tmp_path, installer, 1, first)
+    metrics = _direct_update(tmp_path, installer, 2, second)
+
+    assert metrics["perf/mx_receive_inplace_direct_tensors"] == 0
+    assert metrics["perf/mx_receive_inplace_verified_tensors"] == 0
+    assert model.reloads == 4
+    expected = torch.arange(6, dtype=torch.int32).view(2, 3) ^ first ^ second
+    assert torch.equal(model.layers[0].proj.weight, expected)
+    assert torch.equal(model.layers[0].copy, torch.full((2, 3), 7, dtype=torch.int32) ^ first ^ second)
+
+
+def test_attention_refresh_keeps_graph_storage(monkeypatch):
+    from contextlib import nullcontext
+
+    config = ModuleType("vllm.config")
+    config.set_current_vllm_config = lambda _config: nullcontext()
+    monkeypatch.setitem(sys.modules, "vllm", ModuleType("vllm"))
+    monkeypatch.setitem(sys.modules, "vllm.config", config)
+
+    class Attention(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("scale_inv", torch.ones(1), persistent=False)
+            self.scale = torch.full((1,), 2.0)
+
+        def process_weights_after_loading(self, _dtype):
+            # Processing re-registers what it derives, as vLLM's MLA layers do.
+            self.register_buffer("scale_inv", torch.full((1,), 0.5), persistent=False)
+            self.scale = torch.full((1,), 4.0)
+
+    layer = Attention()
+    buffer, bare = layer.scale_inv, layer.scale
+    installer = _installer()
+    installer._model_config.dtype = torch.bfloat16
+
+    installer._refresh_attention([layer])
+
+    assert layer.scale_inv is buffer and buffer.tolist() == [0.5]
+    assert layer.scale is bare and bare.tolist() == [4.0]
+    assert "scale_inv" in layer._non_persistent_buffers_set
+
+
+def test_peers_must_all_verify_a_tensor_before_it_installs_directly(monkeypatch, tmp_path):
+    model = _DirectModel()
+    installer = _direct_installer(monkeypatch, model)
+    # A peer rank that verified nothing.
+    installer._agree = lambda flags: torch.zeros_like(flags)
+    first = torch.tensor([[1, 0, 2], [0, 3, 0]], dtype=torch.int32)
+    second = torch.tensor([[0, 4, 0], [5, 0, 6]], dtype=torch.int32)
+
+    _direct_update(tmp_path, installer, 1, first)
+    metrics = _direct_update(tmp_path, installer, 2, second)
+
+    assert metrics["perf/mx_receive_inplace_direct_tensors"] == 0
+    assert model.reloads == 4
+    assert torch.equal(model.layers[0].proj.weight, torch.arange(6, dtype=torch.int32).view(2, 3) ^ first ^ second)
+
+
+def test_a_delta_that_misses_a_region_verifies_nothing(monkeypatch, tmp_path):
+    model = _DirectModel()
+    installer = _direct_installer(monkeypatch, model)
+    untouched = torch.zeros(2, 3, dtype=torch.int32)
+    untouched[0, 0] = 1
+    capture = installer._capture_layout
+
+    def two_regions(manifest):
+        result, layout = capture(manifest)
+        # The second row loads as its own copy, which this delta never reaches.
+        row = _recorded(model.NAME, "layers.0.proj.weight", (1, 3), ops=[("narrow", (0, 1, 1), ())], offset=3)
+        first = _recorded(model.NAME, "layers.0.proj.weight", (1, 3), ops=[("narrow", (0, 0, 1), ())])
+        result.copies = [first, row]
+        return result, layout
+
+    installer._capture_layout = two_regions
+    _direct_update(tmp_path, installer, 1, untouched)
+    metrics = _direct_update(tmp_path, installer, 2, untouched)
+
+    assert metrics["perf/mx_receive_inplace_direct_tensors"] == 0

@@ -54,6 +54,7 @@ Environment variables used by the clients and vLLM engine:
 | `MX_REFIT_PREFETCH_WORKERS` | `min(8, CPU count)` | CPU workers the prefetcher uses to apply deltas while the engine serves. |
 | `MX_REFIT_PREFER_PREPARED` | `false` | Install a locally prepared target from object storage before trying a generator peer. |
 | `MX_REFIT_INPLACE` | `false` | Stage each prepared delta's nonzero XOR bytes and install the delta into live vLLM weights in place instead of reloading. See [In-place install](#in-place-install). |
+| `MX_REFIT_INPLACE_DIRECT` | `true` | During an in-place install, XOR verified non-expert tensors straight into live weights instead of reloading their layers. |
 | `MX_REFIT_CHECKSUM_FORMAT` | `adler32` | Checksum algorithm written by canonical S3 trainers. |
 | `MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES` | `4294967296` (4 GiB) | Maximum tensor bytes grouped into one full-checkpoint safetensors object. |
 | `MX_S3_UPLOAD_WORKERS` | `8` | Maximum concurrent multipart uploads per trainer rank. |
@@ -713,11 +714,23 @@ flowchart LR
   post-load processing once. Every other changed tensor goes through the
   layerwise reload with the final copy replaced by an XOR. That reload's inputs
   are built on the GPU when it has room, rather than as host arrays.
+- Most other tensors load as plain byte copies that processing leaves alone,
+  so each rank can XOR its share of the staged bytes straight into live
+  storage instead. The installer records where vLLM's loaders copy each tensor,
+  and checks this against every reload: a decoder layer qualifies once its live
+  tensors changed exactly as that direct XOR predicts, and rerunning its
+  attention layers' processing changes nothing. Later updates of a qualified
+  layer then XOR only its changed tensors, once, and rerun that processing.
+  Tensor-parallel peers adopt only what all of them verified, at the start of
+  the next update. A loader that also writes a mirror, such as a separate decode
+  copy, keeps its layer on the reload path. `MX_REFIT_INPLACE_DIRECT=false`
+  turns direct installs off.
 - Live storage keeps its addresses, so CUDA graphs stay valid.
 - Checkpoint headers are parsed once per process. Deltas never change them, so
   each update reuses the previous index. `perf/mx_receive_inplace_index_time`,
-  `perf/mx_receive_inplace_expert_time`, and `perf/mx_receive_inplace_generic_time`
-  split the install.
+  `perf/mx_receive_inplace_plan_time`, `perf/mx_receive_inplace_expert_time`, and
+  `perf/mx_receive_inplace_generic_time` split the install, and
+  `perf/mx_receive_inplace_direct_tensors` counts the tensors XORed directly.
 - After the engine starts, it holds `initial_serving_version_id` when the
   orchestrator passes one, and otherwise `initial_base_version_id`. The first
   delta from that version installs in place, or surgically, without a full

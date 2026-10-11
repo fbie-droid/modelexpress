@@ -1109,7 +1109,9 @@ behavior and the related settings.
 
 `MX_REFIT_INPLACE=true` additionally installs a prepared delta into live vLLM
 weights in place instead of reloading every tensor; see
-[In-place install](S3_DELTA_WEIGHT_REFIT.md#in-place-install).
+[In-place install](S3_DELTA_WEIGHT_REFIT.md#in-place-install). There,
+`MX_REFIT_INPLACE_DIRECT` (default `true`) XORs verified non-expert tensors
+straight into live weights.
 
 S3 versions normally use `XOR_DELTA`. Integrations may opt into a
 framework-selected cadence of `FULL_HF_CHECKPOINT` versions; these publish

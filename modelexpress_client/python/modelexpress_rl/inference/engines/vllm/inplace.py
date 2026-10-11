@@ -14,6 +14,7 @@ replaced by an XOR.
 from __future__ import annotations
 
 import logging
+import math
 import re
 import time
 import warnings
@@ -27,6 +28,9 @@ from typing import Any
 import numpy as np
 import torch
 
+from modelexpress.refit.reshard.slice_plan import resolve_slice
+from modelexpress.refit.reshard.types import UnsupportedReshard
+from modelexpress_rl import envs as rl_envs
 from modelexpress_rl.inference.staging import StagedDelta, StagedTensor
 from modelexpress_rl.utils import index_checkpoint_tensors
 
@@ -232,6 +236,122 @@ def scatter_expert_shards(
     scratch.view(-1)[expert * shard_bytes + offset] = value
 
 
+@dataclass(frozen=True)
+class DirectCopy:
+    """Where vLLM loads part of one checkpoint tensor into a live parameter.
+
+    ``box`` bounds that part in each checkpoint dimension. ``offset`` and
+    ``strides`` place it in the parameter's storage, in elements.
+    """
+
+    param: str
+    box: tuple[tuple[int, int], ...]
+    offset: int
+    strides: tuple[int, ...]
+
+
+def direct_copies(
+    capture: Any,
+    layout: dict[str, tuple[tuple[int, ...], torch.dtype]],
+    metadata: dict[str, dict],
+    params: dict[str, torch.Tensor],
+    excluded: set[str],
+) -> dict[str, tuple[DirectCopy, ...]]:
+    """Checkpoint tensors that vLLM loads as plain byte copies into live parameters.
+
+    ``capture`` records the view each loader takes of a checkpoint tensor and
+    where it copies that view. A tensor qualifies when every copy keeps its
+    dtype, resolves to a box, and lands in a live parameter that is not
+    excluded and still has its load-time layout.
+    """
+    unsupported = set(capture.unsupported)
+    by_source: dict[str, list[Any]] = defaultdict(list)
+    for copy in capture.copies:
+        by_source[copy.src_name].append(copy)
+    plan: dict[str, tuple[DirectCopy, ...]] = {}
+    for name, copies in by_source.items():
+        info = metadata.get(name)
+        dtype = _TORCH_DTYPES.get(info["dtype"]) if info is not None else None
+        if name in unsupported or dtype is None:
+            continue
+        entries = []
+        for copy in copies:
+            param = params.get(copy.param_name)
+            if (
+                param is None
+                or copy.param_name in excluded
+                or copy.dest_dtype != dtype
+                or param.dtype != dtype
+                or layout.get(copy.param_name) != (tuple(param.shape), param.dtype)
+                or not param.is_contiguous()
+            ):
+                break
+            try:
+                box, strides = resolve_slice(copy, info["shape"])
+            except UnsupportedReshard:
+                break
+            entries.append(
+                DirectCopy(
+                    copy.param_name,
+                    tuple((int(low), int(high)) for low, high in box),
+                    int(copy.dest_offset),
+                    tuple(int(stride) for stride in strides),
+                )
+            )
+        else:
+            plan[name] = tuple(entries)
+    return plan
+
+
+def direct_region(tensor: torch.Tensor, copy: DirectCopy) -> torch.Tensor:
+    """The integer view of the part of ``tensor`` that ``copy`` writes."""
+    view = bits(tensor)
+    return torch.as_strided(
+        view,
+        [high - low for low, high in copy.box],
+        copy.strides,
+        view.storage_offset() + copy.offset,
+    )
+
+
+def xor_direct(
+    target: torch.Tensor,
+    staged: StagedTensor,
+    copy: DirectCopy,
+    *,
+    shape: list[int],
+    dtype: torch.dtype,
+    chunk: int = 1 << 24,
+) -> None:
+    """XOR one tensor's staged bytes into the part of ``target`` that ``copy`` writes.
+
+    Only the checkpoint rows inside the copy's box are built, on the target's
+    device.
+    """
+    itemsize = torch.empty((), dtype=dtype).element_size()
+    row_bytes = itemsize * math.prod(shape[1:])
+    low, high = copy.box[0] if shape else (0, 1)
+    begin, end = low * row_bytes, high * row_bytes
+    first, last = (int(index) for index in np.searchsorted(staged.positions, [begin, end]))
+    window = torch.zeros(end - begin, dtype=torch.uint8, device=target.device)
+    for start in range(first, last, chunk):
+        stop = min(start + chunk, last)
+        offsets = device_offsets(staged.positions[start:stop], target.device) - begin
+        window[offsets] = torch.from_numpy(staged.values[start:stop]).to(target.device)
+    source = window.view(dtype).view([high - low, *shape[1:]] if shape else [])
+    if shape:
+        source = source[(slice(None), *(slice(low, high) for low, high in copy.box[1:]))]
+    direct_region(target, copy).bitwise_xor_(bits(source))
+
+
+def _is_deferred_attention(module: torch.nn.Module) -> bool:
+    try:
+        from vllm.model_executor.layers.attention import is_deferred_attention_layer
+    except ImportError:
+        return False
+    return is_deferred_attention_layer(module)
+
+
 def _routed_experts_class() -> type | None:
     try:
         from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
@@ -431,11 +551,31 @@ class InPlaceInstaller:
         *,
         device: torch.device,
         generic_reload: Callable[[Callable[[Any], None]], None],
+        capture_layout: Callable[[list[tuple[str, torch.dtype, tuple[int, ...]]]], Any]
+        | None = None,
+        refresh_attention: Callable[[list[torch.nn.Module]], None] | None = None,
+        agree: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> None:
         self._model = model
         self._device = device
         self._generic_reload = generic_reload
+        # Direct XOR needs the load layout and a way to rerun attention processing.
+        self._capture_layout = capture_layout
+        self._refresh_attention = refresh_attention
+        # Per checkpoint layout: copies of each captured tensor, and every tensor
+        # whose capture was attempted.
+        self._direct_plan: (
+            tuple[dict[str, dict], dict[str, tuple[DirectCopy, ...]], set[str]] | None
+        ) = None
+        # Tensors whose reload a direct XOR reproduced exactly on every peer rank,
+        # and those this rank saw since peers last agreed.
+        self._verified: set[str] = set()
+        self._pending: set[str] = set()
+        # Reduces flags to those every tensor-parallel peer set; ranks must agree
+        # because attention processing may run collectives.
+        self._agree = agree
         self._experts = routed_expert_layers(model)
+        self._expert_ids = {id(module) for module in self._experts.values()}
         # Layers this rank does not serve: other pipeline stages' placeholders,
         # and checkpoint layers the model never builds, such as unused MTP layers.
         self._served_layers = {
@@ -477,6 +617,11 @@ class InPlaceInstaller:
         if missing:
             raise InPlaceUnsupported(f"no routed-expert module for layers {missing[:5]}")
         index_seconds = time.perf_counter() - index_started
+        plan_started = time.perf_counter()
+        plan = self._plan(catalog, metadata, changed)
+        if self._direct_enabled:
+            self._adopt_verified(catalog)
+        plan_seconds = time.perf_counter() - plan_started
 
         expert_started = time.perf_counter()
         for index in expert_layers:
@@ -487,13 +632,16 @@ class InPlaceInstaller:
         expert_seconds = time.perf_counter() - expert_started
 
         generic_started = time.perf_counter()
-        fed = self._install_generic(staged, changed, catalog, metadata)
+        fed, direct = self._install_generic(staged, changed, catalog, metadata, plan)
         _synchronize(self._device)
         return {
             "perf/mx_receive_inplace_index_time": index_seconds,
+            "perf/mx_receive_inplace_plan_time": plan_seconds,
             "perf/mx_receive_inplace_expert_layers": float(len(expert_layers)),
             "perf/mx_receive_inplace_expert_time": expert_seconds,
             "perf/mx_receive_inplace_generic_tensors": float(fed),
+            "perf/mx_receive_inplace_direct_tensors": float(direct),
+            "perf/mx_receive_inplace_verified_tensors": float(len(self._verified)),
             "perf/mx_receive_inplace_generic_time": time.perf_counter() - generic_started,
         }
 
@@ -538,11 +686,53 @@ class InPlaceInstaller:
         changed: list[str],
         catalog: CheckpointCatalog,
         metadata: dict[str, dict],
+        plan: dict[str, tuple[DirectCopy, ...]],
+    ) -> tuple[int, int]:
+        """Install every changed non-expert tensor; return reloaded and direct counts.
+
+        A group whose changed tensors were all verified takes a direct XOR, and
+        every other group a reload that may verify its tensors for next time.
+        """
+        by_group: dict[int | None, list[str]] = defaultdict(list)
+        for name in changed:
+            if name not in catalog.per_expert:
+                by_group[catalog.layers[name]].append(name)
+        if not by_group:
+            return 0, 0
+        direct_groups = {
+            group
+            for group, names in by_group.items()
+            if all(name in self._verified for name in names)
+        }
+        direct = [name for group in direct_groups for name in by_group[group]]
+        if direct:
+            with torch.no_grad():
+                self._xor_direct(staged, direct, plan, metadata)
+                attention = [
+                    module
+                    for layers in self._attention_by_group(direct_groups).values()
+                    for _path, module in layers
+                ]
+                if attention:
+                    assert self._refresh_attention is not None
+                    self._refresh_attention(attention)
+        reload_groups = set(by_group) - direct_groups
+        if not reload_groups:
+            return 0, len(direct)
+        reloaded = [name for group in reload_groups for name in by_group[group]]
+        fed = self._reload_groups(staged, reloaded, reload_groups, catalog, metadata, plan)
+        return fed, len(direct)
+
+    def _reload_groups(
+        self,
+        staged: StagedDelta,
+        changed: list[str],
+        groups: set[int | None],
+        catalog: CheckpointCatalog,
+        metadata: dict[str, dict],
+        plan: dict[str, tuple[DirectCopy, ...]],
     ) -> int:
-        """Reload every tensor of each changed non-expert group with XOR restore."""
-        groups = {catalog.layers[name] for name in changed if name not in catalog.per_expert}
-        if not groups:
-            return 0
+        """Reload every tensor of each group with XOR restore."""
         fed = [
             name
             for name in catalog.generic
@@ -552,13 +742,11 @@ class InPlaceInstaller:
         if unknown:
             raise InPlaceUnsupported(f"unsupported checkpoint dtypes {unknown}")
         staged_names = set(changed)
+        live = self._live_tensors(groups)
         # Some loaders write live storage directly: tensors reload leaves in place,
         # such as biases, and mirrors a loader keeps, such as fp32 decode copies.
         # They then hold the loaded value rather than an XOR of it.
-        originals = {
-            name: tensor.detach().clone()
-            for name, tensor in self._live_tensors(groups).items()
-        }
+        originals = {name: tensor.detach().clone() for name, tensor in live.items()}
 
         def tensors(zero: bool) -> Iterator[tuple[str, torch.Tensor]]:
             for name in fed:
@@ -567,7 +755,6 @@ class InPlaceInstaller:
                 data = staged_bytes(info["byte_size"], delta, self._input_device(info["byte_size"]))
                 yield name, data.view(_TORCH_DTYPES[info["dtype"]]).view(info["shape"])
 
-        live = self._live_tensors(groups)
         self._generic_reload(lambda _aliases: self._model.load_weights(tensors(zero=True)))
         # XOR the original back into every tensor the zero pass changed, after
         # both passes. A tensor a loader overwrote then ends as original ^ delta;
@@ -580,7 +767,221 @@ class InPlaceInstaller:
         self._generic_reload(lambda _aliases: self._model.load_weights(tensors(zero=False)))
         for name, original in changed_live.items():
             xor_into(live[name].data, original)
+        if self._direct_enabled:
+            with torch.no_grad():
+                self._verify(staged, changed, groups, catalog, metadata, plan, live, originals)
         return len(fed)
+
+    def _verify(
+        self,
+        staged: StagedDelta,
+        changed: list[str],
+        groups: set[int | None],
+        catalog: CheckpointCatalog,
+        metadata: dict[str, dict],
+        plan: dict[str, tuple[DirectCopy, ...]],
+        live: dict[str, torch.Tensor],
+        originals: dict[str, torch.Tensor],
+    ) -> None:
+        """Record a group's changed tensors when a direct XOR reproduces its reload.
+
+        Every live tensor of the group must have changed exactly as the direct
+        XOR predicts, and the delta must reach every region it writes. A mirror
+        that a loader keeps of a changed tensor therefore fails the group, while
+        a tensor a loader rewrites with its unchanged value does not. Attention
+        layers derive their tensors in processing instead, which rerunning must
+        leave unchanged.
+        """
+        writes: dict[str, list[tuple[str, DirectCopy]]] = defaultdict(list)
+        for name in catalog.generic:
+            if catalog.layers[name] in groups:
+                for copy in plan.get(name, ()):
+                    writes[copy.param].append((name, copy))
+        attention = self._attention_by_group(groups)
+        derived = {
+            f"{path}.{name}"
+            for layers in attention.values()
+            for path, module in layers
+            for name in {**module._parameters, **module._buffers}
+        }
+        staged_names = set(changed)
+        # Check each live tensor once, under the name loaders copy into.
+        canonical: dict[int, str] = {}
+        for name, tensor in live.items():
+            if id(tensor) not in canonical or name in writes:
+                canonical[id(tensor)] = name
+        tensor_groups: dict[int | None, list[str]] = defaultdict(list)
+        for name in canonical.values():
+            tensor_groups[layer_key(name.rsplit(".", 1)[0])].append(name)
+        reached = {name: True for name in changed}
+        consistent: dict[int | None, bool] = {}
+        for group in groups:
+            names = [name for name in changed if catalog.layers[name] == group]
+            consistent[group] = bool(names) and all(
+                name in plan and all(copy.param in live for copy in plan[name]) for name in names
+            )
+            if not consistent[group]:
+                continue
+            for name in tensor_groups.get(group, ()):
+                if name in derived:
+                    continue
+                tensor = live[name].data
+                copies = writes.get(name, [])
+                predicted = torch.zeros_like(tensor)
+                for source, copy in copies:
+                    if source in staged_names:
+                        info = metadata[source]
+                        xor_direct(
+                            predicted,
+                            staged.tensor(source),
+                            copy,
+                            shape=info["shape"],
+                            dtype=_TORCH_DTYPES[info["dtype"]],
+                        )
+                if not torch.equal(bits(predicted), bits(tensor) ^ bits(originals[name])):
+                    consistent[group] = False
+                    break
+                for source, copy in copies:
+                    if source in staged_names and not bool(direct_region(predicted, copy).any()):
+                        reached[source] = False
+        # Same calls on every rank, whatever its data showed.
+        for group in sorted(attention, key=lambda key: -1 if key is None else key):
+            identity = self._refresh_is_identity([module for _path, module in attention[group]])
+            consistent[group] = consistent.get(group, False) and identity
+        self._pending.update(
+            name for name in changed if consistent.get(catalog.layers[name]) and reached[name]
+        )
+
+    def _adopt_verified(self, catalog: CheckpointCatalog) -> None:
+        """Keep the verified tensors that every tensor-parallel peer verified."""
+        candidates = self._verified | self._pending
+        self._pending = set()
+        if self._agree is None:
+            self._verified = candidates
+            return
+        names = [name for name in catalog.generic if self._served(catalog.layers[name])]
+        flags = torch.tensor([name in candidates for name in names], dtype=torch.int32)
+        agreed = self._agree(flags).tolist()
+        self._verified = {name for name, flag in zip(names, agreed) if flag}
+
+    @property
+    def _direct_enabled(self) -> bool:
+        return (
+            rl_envs.MX_REFIT_INPLACE_DIRECT
+            and self._capture_layout is not None
+            and self._refresh_attention is not None
+        )
+
+    def _refresh_is_identity(self, layers: list[torch.nn.Module]) -> bool:
+        """Whether rerunning attention processing after the reload changes nothing.
+
+        Processing derives the layers' registered tensors. Other tensor
+        attributes, such as a bound KV cache, are runtime state it does not
+        touch, and copying them could exhaust GPU memory.
+        """
+        assert self._refresh_attention is not None
+
+        def tensors() -> dict[tuple[int, str], torch.Tensor]:
+            found = {}
+            for index, layer in enumerate(layers):
+                values = {**layer._parameters, **layer._buffers}
+                found.update(((index, name), value) for name, value in values.items() if value is not None)
+            return found
+
+        before = {key: value.detach().clone() for key, value in tensors().items()}
+        self._refresh_attention(layers)
+        after = tensors()
+        if after.keys() == before.keys() and all(same_bits(after[key], before[key]) for key in before):
+            return True
+        for key, value in before.items():
+            if key in after and after[key].shape == value.shape:
+                after[key].data.copy_(value)
+        return False
+
+    def _plan(
+        self, catalog: CheckpointCatalog, metadata: dict[str, dict], changed: list[str]
+    ) -> dict[str, tuple[DirectCopy, ...]]:
+        """Where vLLM copies each changed non-expert tensor, captured once per tensor.
+
+        Capturing only tensors that change keeps loaders of frozen parts, such as
+        a vision tower, out of the capture.
+        """
+        if not self._direct_enabled:
+            return {}
+        if self._direct_plan is None or self._direct_plan[0] is not metadata:
+            self._direct_plan = (metadata, {}, set())
+            self._verified = set()
+            self._pending = set()
+        _metadata, plan, attempted = self._direct_plan
+        wanted = [
+            name
+            for name in changed
+            if name not in catalog.per_expert
+            and name not in attempted
+            and metadata[name]["dtype"] in _TORCH_DTYPES
+        ]
+        if not wanted:
+            return plan
+        attempted.update(wanted)
+        manifest = [
+            (name, _TORCH_DTYPES[metadata[name]["dtype"]], tuple(metadata[name]["shape"]))
+            for name in wanted
+        ]
+        excluded = {
+            f"{path}.{name}"
+            for path, module in self._model.named_modules()
+            if self._is_expert_module(path, module) or _is_deferred_attention(module)
+            for name in module._parameters
+        }
+        assert self._capture_layout is not None
+        try:
+            capture, layout = self._capture_layout(manifest)
+            captured = direct_copies(
+                capture, layout, metadata, dict(self._model.named_parameters()), excluded
+            )
+        except Exception as error:
+            # The reload path still installs every tensor.
+            logger.warning("Direct in-place capture failed: %s", error)
+            captured = {}
+        plan.update(captured)
+        logger.info(
+            "Direct in-place capture placed %d of %d tensors", len(captured), len(manifest)
+        )
+        return plan
+
+    def _xor_direct(
+        self,
+        staged: StagedDelta,
+        names: list[str],
+        plan: dict[str, tuple[DirectCopy, ...]],
+        metadata: dict[str, dict],
+    ) -> None:
+        params = dict(self._model.named_parameters())
+        for name in names:
+            info = metadata[name]
+            tensor = staged.tensor(name)
+            for copy in plan[name]:
+                target = params.get(copy.param)
+                if target is None:
+                    raise InPlaceUnsupported(f"live parameter {copy.param} disappeared")
+                xor_direct(
+                    target.data,
+                    tensor,
+                    copy,
+                    shape=info["shape"],
+                    dtype=_TORCH_DTYPES[info["dtype"]],
+                )
+
+    def _attention_by_group(
+        self, groups: set[int | None]
+    ) -> dict[int | None, list[tuple[str, torch.nn.Module]]]:
+        """Deferred attention layers of the groups, whose processing reads their weights."""
+        found: dict[int | None, list[tuple[str, torch.nn.Module]]] = defaultdict(list)
+        for path, module in self._model.named_modules():
+            key = layer_key(path)
+            if key in groups and _is_deferred_attention(module):
+                found[key].append((path, module))
+        return found
 
     def _input_device(self, nbytes: int) -> torch.device:
         """Build a reload input on the GPU when it has room to spare, else on the host.
@@ -595,14 +996,14 @@ class InPlaceInstaller:
         )
         return self._device if free + cached > 2 * nbytes + (1 << 30) else torch.device("cpu")
 
+    def _is_expert_module(self, path: str, module: torch.nn.Module) -> bool:
+        return id(module) in self._expert_ids or "experts" in path.split(".")
+
     def _live_tensors(self, groups: set[int | None]) -> dict[str, torch.Tensor]:
         """Parameters and buffers of the changed groups, except routed experts."""
-        experts = {id(module) for module in self._experts.values()}
         found: dict[str, torch.Tensor] = {}
         for path, module in self._model.named_modules():
-            if id(module) in experts or layer_key(path) not in groups:
-                continue
-            if any(part == "experts" for part in path.split(".")):
+            if layer_key(path) not in groups or self._is_expert_module(path, module):
                 continue
             for name, tensor in list(module.named_parameters(recurse=False)) + list(
                 module.named_buffers(recurse=False)
@@ -646,16 +1047,20 @@ def xor_restore() -> Iterator[None]:
 
 __all__ = [
     "CheckpointCatalog",
+    "DirectCopy",
     "InPlaceInstaller",
     "InPlaceUnsupported",
     "arrange_expert_delta",
     "bits",
+    "direct_copies",
+    "direct_region",
     "process_like_weights",
     "raw_bytes",
     "routed_expert_layers",
     "scatter_expert_shards",
     "shard_nonzero",
     "staged_bytes",
+    "xor_direct",
     "xor_into",
     "xor_restore",
 ]

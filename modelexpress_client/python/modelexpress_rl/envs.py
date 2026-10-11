@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES: int
     MX_REFIT_METADATA_PORT: int
     MX_REFIT_INPLACE: bool
+    MX_REFIT_INPLACE_DIRECT: bool
     MX_REFIT_PREFER_PREPARED: bool
     MX_REFIT_PREFETCH: bool
     MX_REFIT_PREFETCH_POLL_SECONDS: float
@@ -230,6 +231,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_REFIT_INPLACE": lambda: parse_bool(
         os.environ.get("MX_REFIT_INPLACE", "false"),
         "MX_REFIT_INPLACE",
+    ),
+    # XOR verified non-expert tensors straight into live weights during an
+    # in-place install instead of reloading their layers.
+    "MX_REFIT_INPLACE_DIRECT": lambda: parse_bool(
+        os.environ.get("MX_REFIT_INPLACE_DIRECT", "true"),
+        "MX_REFIT_INPLACE_DIRECT",
     ),
     "RANK": lambda: os.environ.get("RANK"),
 }

@@ -593,6 +593,35 @@ def _reserve_runtime_buffer_slots(model: Module, layerwise_info) -> None:
             layer.register_buffer(name, buffer)
 
 
+def _keep_storage(name: str, old: torch.Tensor, new: object) -> None:
+    """Copy a tensor that post-load processing replaced into the original storage."""
+    if (
+        not isinstance(new, torch.Tensor)
+        or new.shape != old.shape
+        or new.dtype != old.dtype
+        or new.device != old.device
+    ):
+        raise InPlaceUnsupported(f"attention processing replaced {name} incompatibly")
+    old.data.copy_(new.data)
+
+
+def _agree_with_peers(flags: torch.Tensor) -> torch.Tensor:
+    """Keep the flags that every tensor-parallel rank of this pipeline stage set."""
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        group = get_tp_group()
+    except (ImportError, AssertionError):
+        return flags
+    if group.world_size == 1:
+        return flags
+    agreed = flags.clone()
+    torch.distributed.all_reduce(
+        agreed, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+    )
+    return agreed
+
+
 class _VllmInstaller(EngineInstaller):
     """Capture vLLM's load layout and install received weights."""
 
@@ -870,6 +899,38 @@ class _VllmInstaller(EngineInstaller):
                     return result.clone()
                 return copy.deepcopy(result)
         self._capture_cache = None
+        capture, param_layout = self._capture_load_layout(
+            manifest, self._convert_native_to_hf
+        )
+        if (
+            not self._is_quantized
+            and not capture.unsupported
+            and not capture.unattributed
+        ):
+            self._capture_cache = (
+                self._capture_key(manifest),
+                _CaptureSnapshot.create(copy.deepcopy((capture, param_layout))),
+            )
+        return capture, param_layout
+
+    def capture_checkpoint_layout(
+        self, manifest: list[tuple[str, torch.dtype, tuple[int, ...]]]
+    ) -> tuple[
+        CaptureResult,
+        dict[str, tuple[tuple[int, ...], torch.dtype]],
+    ]:
+        """Record how checkpoint tensors, under their checkpoint names, map into
+        vLLM's load-time parameters."""
+        return self._capture_load_layout(manifest, None)
+
+    def _capture_load_layout(
+        self,
+        manifest: list[tuple[str, torch.dtype, tuple[int, ...]]],
+        convert_native_to_hf: Callable[[dict], dict] | None,
+    ) -> tuple[
+        CaptureResult,
+        dict[str, tuple[tuple[int, ...], torch.dtype]],
+    ]:
         try:
             from vllm.config import set_current_vllm_config
             from vllm.model_executor.model_loader.reload.layerwise import (
@@ -901,7 +962,7 @@ class _VllmInstaller(EngineInstaller):
                 # weight_loader (norms) so their copies are attributed, not dropped.
                 capture = capture_weights(
                     model,
-                    convert_source_weights(self._convert_native_to_hf, manifest),
+                    convert_source_weights(convert_native_to_hf, manifest),
                     default_weight_loader=default_weight_loader,
                 )
                 param_layout = {
@@ -921,15 +982,6 @@ class _VllmInstaller(EngineInstaller):
             len(capture.unsupported),
             self._is_quantized,
         )
-        if (
-            not self._is_quantized
-            and not capture.unsupported
-            and not capture.unattributed
-        ):
-            self._capture_cache = (
-                self._capture_key(manifest),
-                _CaptureSnapshot.create(copy.deepcopy((capture, param_layout))),
-            )
         return capture, param_layout
 
     def install_tensors(self, tensors: dict[str, torch.Tensor]) -> None:
@@ -1155,6 +1207,9 @@ class _VllmInstaller(EngineInstaller):
                 self._model,
                 device=self._device,
                 generic_reload=lambda load: self._reload(load, xor=True),
+                capture_layout=self.capture_checkpoint_layout,
+                refresh_attention=self._refresh_attention,
+                agree=_agree_with_peers,
             )
         try:
             metrics = self._inplace.install(checkpoint.path, checkpoint.staging)
@@ -1171,6 +1226,41 @@ class _VllmInstaller(EngineInstaller):
             metrics["perf/mx_receive_inplace_time"],
         )
         return metrics
+
+    @torch.no_grad()
+    def _refresh_attention(self, layers: list[Module]) -> None:
+        """Rerun deferred attention processing on live layers, as a reload's finalize does.
+
+        Processing may re-register tensors it derives. Copy each replacement into
+        the tensor it replaced so captured graphs keep their storage.
+        """
+        from vllm.config import set_current_vllm_config
+
+        with set_current_vllm_config(self._vllm_config):
+            for layer in layers:
+                registered = {
+                    "_parameters": dict(layer._parameters),
+                    "_buffers": dict(layer._buffers),
+                }
+                bare = {
+                    name: value
+                    for name, value in vars(layer).items()
+                    if isinstance(value, torch.Tensor)
+                }
+                layer.process_weights_after_loading(self._model_config.dtype)
+                for container, before in registered.items():
+                    current = getattr(layer, container)
+                    for name, old in before.items():
+                        new = current.get(name)
+                        if old is None or new is old:
+                            continue
+                        _keep_storage(name, old, new)
+                        current[name] = old
+                for name, old in bare.items():
+                    new = vars(layer).get(name)
+                    if new is not old:
+                        _keep_storage(name, old, new)
+                        vars(layer)[name] = old
 
     def install_checkpoint(self, path: str | Path) -> None:
         """Reload a prepared safetensors checkpoint into the live model."""
