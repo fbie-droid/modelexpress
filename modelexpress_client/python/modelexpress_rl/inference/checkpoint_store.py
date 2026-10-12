@@ -52,6 +52,10 @@ def _copy_checkpoint_file(source: str, destination: str) -> str:
     return shutil.copy2(source, destination)
 
 
+# A prefetcher polls as soon as this file's modification time changes.
+PREFETCH_TRIGGER_FILE = "prefetch.trigger"
+
+
 def _encode_cache_component(value: str) -> str:
     """Encode an opaque ID as exactly one filesystem path component."""
     # quote() never escapes dots, even with safe="". Encode dot-only IDs
@@ -62,9 +66,14 @@ def _encode_cache_component(value: str) -> str:
 
 
 class CheckpointState(str, Enum):
-    """Preparation state persisted across receiver processes."""
+    """Preparation state persisted across receiver processes.
+
+    ``STAGED`` means the target's delta is verified and staged against its base,
+    whose checkpoint files still hold the base's bytes.
+    """
 
     READY = "READY"
+    STAGED = "STAGED"
     UPDATING = "UPDATING"
 
 
@@ -76,6 +85,8 @@ class CheckpointRecord:
     version: str
     files: dict[str, list[int]] | None = None
     source: dict[str, str] | None = None
+    # The version whose bytes the checkpoint files hold, for a STAGED version.
+    base: str | None = None
 
     @classmethod
     def from_dict(cls, value: dict | None) -> CheckpointRecord | None:
@@ -87,16 +98,25 @@ class CheckpointRecord:
             return None
         files = value.get("files")
         source = value.get("source")
+        base = value.get("base")
         if files is not None and not isinstance(files, dict):
             return None
         if source is not None and not isinstance(source, dict):
+            return None
+        if (status is CheckpointState.STAGED) != isinstance(base, str):
             return None
         return cls(
             status=status,
             version=value["version"],
             files=files,
             source=source,
+            base=base,
         )
+
+    @property
+    def files_version(self) -> str:
+        """The version whose bytes the checkpoint files hold."""
+        return self.base if self.base is not None else self.version
 
     def to_dict(self) -> dict[str, object]:
         value: dict[str, object] = {
@@ -107,6 +127,8 @@ class CheckpointRecord:
             value["files"] = self.files
         if self.source is not None:
             value["source"] = self.source
+        if self.base is not None:
+            value["base"] = self.base
         return value
 
 
@@ -157,6 +179,7 @@ class LocalCheckpointStore:
         #     staging/<version>/        derived nonzero XOR bytes of one delta
         #     state.json                current preparation transaction
         #     speculation.json          unregistered target being prepared ahead
+        #     want.json                 target an engine waits to prepare
         #     active.json               version committed after engine install
         #     .lock                     cross-process cache coordination
         #     .prepare.lock             serializes preparation requests
@@ -166,7 +189,9 @@ class LocalCheckpointStore:
         # lineage. Materialized checkpoints are rebuildable outputs for engines
         # that require an ordinary checkpoint directory. Preparation updates
         # state.json without changing active.json; installation advances
-        # active.json only after the engine reload succeeds.
+        # active.json only after the engine reload succeeds. A STAGED version
+        # is verified and staged but not yet materialized: the checkpoint
+        # files still hold its base.
         self.cache = Path(root) / _encode_cache_component(model_name)
         self.full_cache = self.cache / "full"
         self.delta_cache = self.cache / "deltas"
@@ -176,6 +201,7 @@ class LocalCheckpointStore:
         self.state_path = self.cache / "state.json"
         self.speculation_path = self.cache / "speculation.json"
         self.active_path = self.cache / "active.json"
+        self.want_path = self.cache / "want.json"
         self.lock_path = self.cache / ".lock"
         self.prepare_lock_path = self.cache / ".prepare.lock"
         self.install_lock_path = self.cache / ".install.lock"
@@ -431,18 +457,40 @@ class LocalCheckpointStore:
         version: str,
         checkpoint_paths: Iterable[Path],
         source: dict[str, str] | None = None,
+        base: str | None = None,
     ) -> None:
         state = CheckpointRecord(
             status=status,
             version=version,
             files=(
                 checkpoint_files_state(checkpoint_paths)
-                if status is CheckpointState.READY
+                if status is not CheckpointState.UPDATING
                 else None
             ),
             source=source,
+            base=base,
         )
         self._write_json(self.state_path, state.to_dict())
+
+    def wanted(self) -> dict | None:
+        """Return the target an engine waits to prepare, if any."""
+        return self._read_json(self.want_path)
+
+    def write_wanted(self, value: dict[str, object]) -> None:
+        try:
+            self._write_json(self.want_path, value)
+        except OSError:
+            logger.debug("want record is unavailable", exc_info=True)
+
+    def clear_wanted(self) -> None:
+        self.want_path.unlink(missing_ok=True)
+
+    def notify_prefetcher(self) -> None:
+        """Ask a running prefetcher to poll now instead of at its next interval."""
+        try:
+            (self.cache / PREFETCH_TRIGGER_FILE).touch()
+        except OSError:
+            logger.debug("prefetch trigger is unavailable", exc_info=True)
 
     def speculation(self) -> dict | None:
         """Return the unregistered target prepared ahead of its registration."""
@@ -571,6 +619,7 @@ class LocalCheckpointStore:
 
 
 __all__ = [
+    "PREFETCH_TRIGGER_FILE",
     "CheckpointCacheCapacityError",
     "CheckpointRecord",
     "CheckpointState",

@@ -394,6 +394,7 @@ class ModelExpressGeneratorClient:
             poll_seconds=rl_envs.MX_REFIT_PREFETCH_POLL_SECONDS,
             s3_watch=rl_envs.MX_REFIT_PREFETCH_S3_WATCH,
             parent_pid=os.getpid(),
+            staged=canonical.staged_checkpoints,
         )
         self._prefetch_cache_dir = settings.cache_dir()
         # One process per host cache; extra co-located ranks exit at once.

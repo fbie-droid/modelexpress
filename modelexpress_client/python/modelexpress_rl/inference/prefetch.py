@@ -34,7 +34,12 @@ from ..control import WeightVersion, WeightVersionState, _weight_version
 from ..object_storage import ObjectStorageType
 from ..s3 import S3Client
 from ..train import WeightPayloadFormat
-from .checkpoint_store import CheckpointState, LocalCheckpointStore
+from .checkpoint_store import (
+    PREFETCH_TRIGGER_FILE,
+    CheckpointRecord,
+    CheckpointState,
+    LocalCheckpointStore,
+)
 from .receiver import (
     ObjectStorageGeneratorConfig,
     PreparedCheckpoint,
@@ -48,8 +53,11 @@ from .version_chain import resolve_replay_chain
 logger = logging.getLogger("modelexpress_rl.inference.prefetch")
 
 STATUS_FILE = "prefetch.json"
-TRIGGER_FILE = "prefetch.trigger"
+TRIGGER_FILE = PREFETCH_TRIGGER_FILE
 LOCK_FILE = ".prefetch.lock"
+
+# How often a rewrite checks for an engine waiting on a following delta.
+_WANTED_CHECK_SECONDS = 0.1
 
 _REPLAY_FORMATS = frozenset(
     {WeightPayloadFormat.XOR_DELTA, WeightPayloadFormat.FULL_HF_CHECKPOINT}
@@ -74,6 +82,8 @@ class PrefetchSettings:
     poll_seconds: float
     s3_watch: bool
     parent_pid: int
+    # Leave verified deltas staged on their base's files, rewritten later.
+    staged: bool = False
 
     def object_storage(self) -> ObjectStorageGeneratorConfig:
         return ObjectStorageGeneratorConfig(
@@ -160,7 +170,7 @@ class RefitPrefetcher:
     def poll_once(self) -> str | None:
         """Prepare at most one version; return the cache ID it prepared."""
         state = self._store.state()
-        if state is None or state.status is not CheckpointState.READY:
+        if state is None or state.status is CheckpointState.UPDATING:
             return None
         if not self._may_move_head(state.version):
             return None
@@ -171,11 +181,83 @@ class RefitPrefetcher:
                 return self._prepare(
                     target.version_id,
                     kind="registered",
-                    run=lambda: self._checkpoint.prepare_chain(chain),
+                    run=lambda: self._checkpoint.prepare_chain(
+                        chain, staged=self._settings.staged, announce=False
+                    ),
                 )
         if self._settings.s3_watch:
-            return self._speculate(head=state.version, head_source=state.source)
+            prepared = self._speculate(head=state.version, head_source=state.source)
+            if prepared is not None:
+                return prepared
+        if (
+            state.status is CheckpointState.STAGED
+            and _active_version(self._store) == state.version
+        ):
+            # The engine serves the staged head, so write it into the files
+            # now. A delta that appears meanwhile joins the same pass.
+            return self._prepare(
+                state.version,
+                kind="rewrite",
+                run=lambda: self._checkpoint.materialize_head(
+                    staged=self._settings.staged,
+                    following=self._following(state),
+                ),
+            )
         return None
+
+    def _following(self, head: CheckpointRecord) -> Any:
+        """Return a check for a delta on top of ``head``, for a rewrite to join.
+
+        An engine waiting to prepare such a delta is seen within a tenth of a
+        second; registry and S3 checks run at most once per poll interval.
+        """
+        checked = {"wanted": 0.0, "remote": time.monotonic()}
+
+        def following() -> tuple[_S3Version, bool] | None:
+            now = time.monotonic()
+            if now - checked["wanted"] >= _WANTED_CHECK_SECONDS:
+                checked["wanted"] = now
+                found = self._wanted_delta(head.version)
+                if found is not None:
+                    return found, False
+            if now - checked["remote"] < self._settings.poll_seconds:
+                return None
+            checked["remote"] = now
+            try:
+                target = self._newest_registered() if self._registry_listing else None
+                if target is not None and self._should_prepare(target, head=head.version):
+                    chain = self._registered_chain(target, head=head.version)
+                    if chain is not None and len(chain) == 1:
+                        return chain[0], False
+                if self._settings.s3_watch:
+                    found = self._next_speculative(head=head.version, head_source=head.source)
+                    if found is not None:
+                        return found, True
+            except Exception as error:
+                # A failed check must not abort the rewrite it runs inside.
+                logger.warning("prefetch check during a rewrite failed: %s", error)
+            return None
+
+        return following
+
+    def _wanted_delta(self, head: str) -> _S3Version | None:
+        """Return the registered delta on top of ``head`` that an engine waits for."""
+        wanted = self._store.wanted()
+        if (
+            wanted is None
+            or not wanted.get("staged")
+            or wanted.get("chain_length") != 1
+            or wanted.get("base_version") != head
+            or not isinstance(wanted.get("version"), str)
+            or not isinstance(wanted.get("uri"), str)
+        ):
+            return None
+        return _S3Version(
+            version_id=wanted["version"],
+            base_version_id=head,
+            payload_format=WeightPayloadFormat.XOR_DELTA,
+            uri=wanted["uri"],
+        )
 
     def run(self) -> None:
         """Poll until the engine process that started this prefetcher exits."""
@@ -312,6 +394,22 @@ class RefitPrefetcher:
         self, *, head: str, head_source: dict[str, str] | None
     ) -> str | None:
         """Prepare the unregistered delta whose snapshot names the head as base."""
+        version = self._next_speculative(head=head, head_source=head_source)
+        if version is None:
+            return None
+        return self._prepare(
+            version.version_id,
+            kind="speculative",
+            run=lambda: self._checkpoint.prepare_speculative(
+                version, staged=self._settings.staged
+            ),
+            uri=version.uri,
+        )
+
+    def _next_speculative(
+        self, *, head: str, head_source: dict[str, str] | None
+    ) -> _S3Version | None:
+        """Return the unregistered delta whose snapshot names the head as base."""
         speculation = self._store.speculation()
         if speculation is not None and speculation.get("version") == head:
             return None
@@ -333,16 +431,10 @@ class RefitPrefetcher:
             uri = f"{prefix}/{child}/{index_name}"
             if not self._is_complete_child_delta(uri, base_version=head_version):
                 continue
-            version = _S3Version(
+            return _S3Version(
                 version_id=speculative_version_id(uri),
                 base_version_id=head,
                 payload_format=WeightPayloadFormat.XOR_DELTA,
-                uri=uri,
-            )
-            return self._prepare(
-                version.version_id,
-                kind="speculative",
-                run=lambda: self._checkpoint.prepare_speculative(version),
                 uri=uri,
             )
         return None
@@ -399,7 +491,7 @@ class RefitPrefetcher:
         self._write_status(phase="preparing", version=version_id, kind=kind, uri=uri)
         logger.info("prefetch preparing %s version %s", kind, version_id)
         try:
-            prepared: PreparedCheckpoint = run()
+            prepared: PreparedCheckpoint | None = run()
         except Exception as error:
             logger.warning("prefetch of %s failed: %s", version_id, error)
             self._write_status(
@@ -411,9 +503,16 @@ class RefitPrefetcher:
                 logger.exception("prefetch recovery after a failed preparation failed")
             return None
         duration = time.monotonic() - started
+        if prepared is None:
+            self._write_status(phase="idle", version=version_id, kind=kind, uri=uri)
+            return None
         logger.info(
             "prefetch prepared %s version %s in %.2fs", kind, prepared.target_version, duration
         )
+        state = self._store.state()
+        if uri is None and state is not None and state.version == prepared.target_version:
+            # A rewrite can prepare the delta it joined, so name the head's source.
+            uri = (state.source or {}).get("uri")
         self._write_status(
             phase="prepared",
             version=prepared.target_version,

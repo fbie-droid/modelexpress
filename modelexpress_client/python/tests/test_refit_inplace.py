@@ -3,6 +3,7 @@
 
 """Staging of nonzero XOR bytes and in-place installation of deltas."""
 
+import dataclasses
 import functools
 import json
 import sys
@@ -13,10 +14,11 @@ import numpy as np
 import pytest
 import safetensors.numpy
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 
 from modelexpress_rl import ObjectStorageGeneratorConfig, ObjectStorageType, WeightPayloadFormat
 from modelexpress_rl.inference import receiver as receiver_module
+from modelexpress_rl.inference.checkpoint_store import CheckpointState
 from modelexpress_rl.inference.engines.vllm import inplace as inplace_module
 from modelexpress_rl.inference.engines.vllm import installer as installer_module
 from modelexpress_rl.inference.plan import PreparedCheckpointArtifact
@@ -204,11 +206,15 @@ class _FakeS3:
         pass
 
 
-def _checkpoint(tmp_path, s3, *, initialize=True):
+def _checkpoint(tmp_path, s3, *, initialize=True, tensors=None):
     launch = tmp_path / "launch"
     if not launch.exists():
         launch.mkdir()
-        save_file({"weight": torch.tensor([1.0, 2.0])}, launch / "model.safetensors")
+        tensors = tensors or {"weight": [1.0, 2.0]}
+        save_file(
+            {name: torch.tensor(values) for name, values in tensors.items()},
+            launch / "model.safetensors",
+        )
     checkpoint = receiver_module._LocalCheckpoint(
         model_name="test/model",
         config=ObjectStorageGeneratorConfig(
@@ -310,6 +316,231 @@ def test_evicting_a_version_removes_its_staging(monkeypatch, tmp_path):
     with pytest.raises(receiver_module.CheckpointCacheCapacityError):
         store.ensure_capacity(1, protected_versions=())
     assert not store.staging_path("v1").exists()
+
+
+# Each delta changes some tensors of a two-tensor checkpoint.
+_LINEAGE = {
+    "base": {"a": [1.0, 2.0], "b": [3.0, 4.0]},
+    "v1": {"a": [1.0, 5.0], "b": [3.0, 4.0]},
+    "v2": {"a": [9.0, 5.0], "b": [6.0, 4.0]},
+    "v3": {"a": [7.0, 5.0], "b": [6.0, 4.0]},
+    "other": {"a": [8.0, 5.0], "b": [3.0, 4.0]},
+}
+
+
+def _lineage_snapshot(version, base):
+    """The delta from ``base`` to ``version`` of every tensor that changes."""
+    tensors, checksums = {}, {}
+    for name, values in _LINEAGE[version].items():
+        delta, changed = compute_delta(_bytes(values), _bytes(_LINEAGE[base][name]))
+        if changed:
+            tensors[name] = compress_delta(delta)
+            checksums[name] = _checksum(_bytes(values))
+    index = json.dumps(
+        {
+            "metadata": {
+                "version": version,
+                "base_version": base,
+                "delta_encoding": "xor",
+                "compression_format": "zstd",
+                "checksum_format": "adler32",
+            },
+            "weight_map": {name: SHARD for name in tensors},
+        }
+    ).encode()
+    shard = safetensors.numpy.save(tensors, metadata=checksums)
+    return {_uri(version): index, f"{PREFIX}/{version}/{SHARD}": shard}
+
+
+def _lineage_checkpoint(tmp_path, monkeypatch):
+    monkeypatch.setenv("MX_REFIT_INPLACE", "true")
+    objects = {}
+    for version, base in (("v1", "base"), ("v2", "v1"), ("v3", "v2")):
+        objects.update(_lineage_snapshot(version, base))
+    s3 = _FakeS3(objects)
+    return _checkpoint(tmp_path, s3, tensors=_LINEAGE["base"]), s3
+
+
+def _lineage_delta(version):
+    base = {"v1": "base", "v2": "v1", "v3": "v2"}[version]
+    return _delta(version, base=base, identity=version)
+
+
+def _files(checkpoint):
+    """The tensors the cache head's checkpoint files hold."""
+    state = checkpoint.store.state()
+    path = checkpoint.store.checkpoint_path(state.files_version) / "model.safetensors"
+    return {name: tensor.tolist() for name, tensor in load_file(path).items()}
+
+
+def _staged_target(prepared):
+    """The target a STAGED preparation describes: its files XOR its staging."""
+    staged = StagedDelta(prepared.staging)
+    tensors = load_file(prepared.path / "model.safetensors")
+    for name in list(tensors):
+        if name in staged:
+            data = tensors[name].reshape(-1).view(torch.uint8)
+            delta = staged.tensor(name)
+            data[torch.from_numpy(delta.positions.astype(np.int64))] ^= torch.from_numpy(
+                np.array(delta.values)
+            )
+    staged.close()
+    return {name: tensor.tolist() for name, tensor in tensors.items()}
+
+
+def test_staged_preparation_checks_a_delta_without_writing_the_files(monkeypatch, tmp_path):
+    checkpoint, s3 = _lineage_checkpoint(tmp_path, monkeypatch)
+
+    prepared = checkpoint.prepare_chain((_lineage_delta("v1"),), staged=True)
+
+    state = checkpoint.store.state()
+    assert (state.status, state.version, state.base) == (CheckpointState.STAGED, "v1", "base")
+    assert not prepared.materialized and prepared.staging_base == "base"
+    assert prepared.path == checkpoint.store.full_path("base")
+    assert _files(checkpoint) == _LINEAGE["base"]
+    assert _staged_target(prepared) == _LINEAGE["v1"]
+    # A co-located rank reuses the staged head; a caller that needs files gets them.
+    follower = _checkpoint(tmp_path, s3, initialize=False)
+    assert not follower.prepare_chain((_lineage_delta("v1"),), staged=True).materialized
+    materialized = follower.prepare_chain((_lineage_delta("v1"),))
+    assert materialized.materialized and checkpoint.store.state().status is CheckpointState.READY
+    assert _files(checkpoint) == _LINEAGE["v1"]
+
+
+def test_a_delta_with_a_wrong_checksum_leaves_a_ready_head_ready(monkeypatch, tmp_path):
+    checkpoint, s3 = _lineage_checkpoint(tmp_path, monkeypatch)
+    snapshot = _lineage_snapshot("v1", "base")
+    shard = safetensors.numpy.load(snapshot[f"{PREFIX}/v1/{SHARD}"])
+    s3.objects[f"{PREFIX}/v1/{SHARD}"] = safetensors.numpy.save(shard, metadata={"a": "00000001"})
+
+    with pytest.raises(RuntimeError, match="checksum differs"):
+        checkpoint.prepare_chain((_lineage_delta("v1"),), staged=True)
+
+    state = checkpoint.store.state()
+    assert (state.status, state.version) == (CheckpointState.READY, "base")
+    assert _files(checkpoint) == _LINEAGE["base"]
+
+
+def test_a_delta_on_a_staged_head_writes_the_head_in_the_same_pass(monkeypatch, tmp_path):
+    checkpoint, _s3 = _lineage_checkpoint(tmp_path, monkeypatch)
+    checkpoint.activate(checkpoint.prepare_chain((_lineage_delta("v1"),), staged=True))
+
+    prepared = checkpoint.prepare_chain((_lineage_delta("v2"),), staged=True)
+
+    state = checkpoint.store.state()
+    assert (state.status, state.version, state.base) == (CheckpointState.STAGED, "v2", "v1")
+    assert prepared.path == checkpoint.store.materialized_path("v1")
+    assert _files(checkpoint) == _LINEAGE["v1"]
+    assert _staged_target(prepared) == _LINEAGE["v2"]
+
+
+def test_a_staged_head_is_rewritten_once_the_engine_serves_it(monkeypatch, tmp_path):
+    checkpoint, _s3 = _lineage_checkpoint(tmp_path, monkeypatch)
+    checkpoint.activate(checkpoint.prepare_chain((_lineage_delta("v1"),), staged=True))
+    checkpoint.activate(checkpoint.prepare_chain((_lineage_delta("v2"),), staged=True))
+
+    rewritten = checkpoint.materialize_head(staged=True)
+
+    assert rewritten.materialized and rewritten.target_version == "v2"
+    state = checkpoint.store.state()
+    assert (state.status, state.version) == (CheckpointState.READY, "v2")
+    assert _files(checkpoint) == _LINEAGE["v2"]
+    assert checkpoint.materialize_head(staged=True) is None
+    # The next delta then only reads the rewritten files.
+    following = checkpoint.prepare_chain((_lineage_delta("v3"),), staged=True)
+    assert following.staging_base == "v2" and _staged_target(following) == _LINEAGE["v3"]
+
+
+def test_a_rewrite_joins_a_delta_that_appears_while_it_runs(monkeypatch, tmp_path):
+    checkpoint, _s3 = _lineage_checkpoint(tmp_path, monkeypatch)
+    checkpoint.activate(checkpoint.prepare_chain((_lineage_delta("v1"),), staged=True))
+    checkpoint.activate(checkpoint.prepare_chain((_lineage_delta("v2"),), staged=True))
+    answers = iter([None, (_lineage_delta("v3"), False)])
+
+    prepared = checkpoint.materialize_head(staged=True, following=lambda: next(answers, None))
+
+    # "a" was rewritten before v3 appeared and "b" after, in the pass that checked v3.
+    state = checkpoint.store.state()
+    assert (state.status, state.version, state.base) == (CheckpointState.STAGED, "v3", "v2")
+    assert prepared.target_version == "v3" and not prepared.materialized
+    assert _files(checkpoint) == _LINEAGE["v2"]
+    assert _staged_target(prepared) == _LINEAGE["v3"]
+    # v3 stages only the tensor it changes, not the ones its pass rewrote.
+    staged = StagedDelta(prepared.staging)
+    assert staged.names() == ["a"]
+    staged.close()
+
+
+def test_a_rewrite_finishes_alone_when_the_following_delta_is_unreadable(
+    monkeypatch, tmp_path
+):
+    checkpoint, _s3 = _lineage_checkpoint(tmp_path, monkeypatch)
+    checkpoint.activate(checkpoint.prepare_chain((_lineage_delta("v1"),), staged=True))
+    checkpoint.activate(checkpoint.prepare_chain((_lineage_delta("v2"),), staged=True))
+    answers = iter([None, (_delta("lost", base="v2", identity="lost"), False)])
+
+    prepared = checkpoint.materialize_head(staged=True, following=lambda: next(answers, None))
+
+    assert prepared.target_version == "v2" and prepared.materialized
+    assert checkpoint.store.state().status is CheckpointState.READY
+    assert _files(checkpoint) == _LINEAGE["v2"]
+
+
+def test_a_speculative_staged_head_reverts_without_rewriting(monkeypatch, tmp_path):
+    checkpoint, s3 = _lineage_checkpoint(tmp_path, monkeypatch)
+    s3.objects.update(_lineage_snapshot("v2", "v1"))
+    store = checkpoint.store
+    speculative = receiver_module.speculative_version_id(_uri("v1"))
+    checkpoint.prepare_speculative(_delta(speculative, base="base", identity="v1"), staged=True)
+    assert store.state().status is CheckpointState.STAGED
+
+    adopted = checkpoint.prepare_chain((_lineage_delta("v1"),), staged=True)
+    assert adopted.staging == store.staging_path("v1") and not adopted.materialized
+
+    unwanted = receiver_module.speculative_version_id(_uri("v2"))
+    checkpoint.prepare_speculative(_delta(unwanted, base="v1", identity="v2"), staged=True)
+    assert _files(checkpoint) == _LINEAGE["v1"]
+    s3.objects.update(_lineage_snapshot("other", "v1"))
+    other = checkpoint.prepare_chain((_delta("other", base="v1", identity="other"),), staged=True)
+
+    assert other.staging_base == "v1" and not store.staging_path(unwanted).exists()
+    assert store.speculation() is None
+    assert _staged_target(other) == _LINEAGE["other"]
+
+
+def test_installing_a_staged_target_activates_it_and_wakes_the_prefetcher(
+    monkeypatch, tmp_path
+):
+    checkpoint, _s3 = _lineage_checkpoint(tmp_path, monkeypatch)
+    prepared = checkpoint.prepare_chain((_lineage_delta("v1"),), staged=True)
+    trigger = checkpoint.store.cache / "prefetch.trigger"
+
+    with checkpoint.installation_context(prepared):
+        assert checkpoint.store.active_version() == "base"
+
+    assert checkpoint.store.active_version() == "v1" and trigger.exists()
+    # The installed version and its base's files both stay protected.
+    assert {"v1", "base"} <= receiver_module._protected_versions(checkpoint.store, "v1")
+
+
+def test_a_staged_version_keeps_its_base_files(monkeypatch, tmp_path):
+    checkpoint, _s3 = _lineage_checkpoint(tmp_path, monkeypatch)
+    checkpoint.activate(checkpoint.prepare_chain((_lineage_delta("v1"),), staged=True))
+    checkpoint.prepare_chain((_lineage_delta("v2"),), staged=True)
+
+    assert {"v1", "v2"} <= receiver_module._protected_versions(checkpoint.store, "v2")
+
+
+def test_staged_deltas_turn_base_tensors_into_the_target(tmp_path):
+    before, after = [1.0, 2.0, 3.0], [1.0, 7.0, 3.0]
+    staged = _stage(tmp_path / "staging", {"a": (_bytes(before), _bytes(after))})
+    staged.close()
+    tensors = [("a", torch.tensor(before)), ("c", torch.tensor([4.0]))]
+
+    out = dict(installer_module._with_staged_delta(tensors, tmp_path / "staging"))
+
+    assert out["a"].tolist() == after and out["c"].tolist() == [4.0]
+    assert tensors[0][1].tolist() == before
 
 
 def test_staged_delta_reads_row_ranges_and_checks_file_sizes(tmp_path):
@@ -855,23 +1086,30 @@ def test_in_place_install_needs_the_staged_base_to_be_live(staged_checkpoint):
     assert _InPlace.calls == [(staged_checkpoint.path, staged_checkpoint.staging)]
 
 
-def test_unsupported_in_place_install_falls_back_to_a_reload(staged_checkpoint, monkeypatch):
+@pytest.mark.parametrize("materialized", [True, False])
+def test_unsupported_in_place_install_falls_back_to_a_reload(
+    staged_checkpoint, monkeypatch, materialized
+):
     installer = _installer()
     _InPlace.error = inplace_module.InPlaceUnsupported("no routed experts")
     reloaded = []
-    monkeypatch.setattr(installer, "install_checkpoint", lambda path: reloaded.append(path))
+    monkeypatch.setattr(
+        installer, "install_checkpoint", lambda path, staged=None: reloaded.append((path, staged))
+    )
     installer._live_version = "v1"
+    checkpoint = dataclasses.replace(staged_checkpoint, materialized=materialized)
 
-    installer.install(PreparedCheckpointArtifact(staged_checkpoint))
+    installer.install(PreparedCheckpointArtifact(checkpoint))
 
-    assert reloaded == [staged_checkpoint.path]
+    # Files that still hold the staging base reload through the staged delta.
+    assert reloaded == [(checkpoint.path, None if materialized else checkpoint.staging)]
     assert installer._live_version == "v2"
 
 
 def test_in_place_install_replaces_the_reload(staged_checkpoint, monkeypatch):
     installer = _installer()
     reloaded = []
-    monkeypatch.setattr(installer, "install_checkpoint", lambda path: reloaded.append(path))
+    monkeypatch.setattr(installer, "install_checkpoint", lambda path, staged=None: reloaded.append(path))
     installer._live_version = "v1"
 
     metrics = installer.install(PreparedCheckpointArtifact(staged_checkpoint))

@@ -43,6 +43,7 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
         model_name: str,
         config: ObjectStorageGeneratorConfig,
         stream_full_checkpoints: bool = False,
+        staged_checkpoints: bool = False,
     ) -> None:
         if config.storage_type is not ObjectStorageType.S3:
             raise ValueError("only S3 object storage is currently supported")
@@ -66,12 +67,18 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
             raise
         self._active: PreparedCheckpointArtifact | None = None
         self._stream_full_checkpoints = stream_full_checkpoints
+        self._staged_checkpoints = staged_checkpoints
         self._streams: list[StreamedCheckpoint] = []
 
     @property
     def model_name(self) -> str:
         """Name keying this method's host checkpoint cache."""
         return self._model_name
+
+    @property
+    def staged_checkpoints(self) -> bool:
+        """Whether preparations may leave a delta staged on its base's files."""
+        return self._staged_checkpoints
 
     @property
     def requires_full_root(self) -> bool:
@@ -182,7 +189,9 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
                     self._checkpoint = checkpoint
                     self._initialized = True
                 started = time.perf_counter()
-                checkpoint = self._checkpoint.prepare_chain(tuple(versions))
+                checkpoint = self._checkpoint.prepare_chain(
+                    tuple(versions), staged=self._staged_checkpoints
+                )
                 checkpoint.metrics["perf/mx_receive_prepare_time"] = (
                     time.perf_counter() - started
                 )

@@ -3317,7 +3317,7 @@ def test_delta_apply_alternates_checkpoint_files(monkeypatch, tmp_path):
 
     def record(items, process, **kwargs):
         items = list(items)
-        order.extend(name for name, _data, _checksum in items)
+        order.extend(tensor.name for tensor in items)
         return threadpool_map(items, process, **kwargs)
 
     monkeypatch.setattr(receiver_module, "threadpool_map", record)

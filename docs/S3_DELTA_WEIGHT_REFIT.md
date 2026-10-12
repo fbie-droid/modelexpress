@@ -53,7 +53,7 @@ Environment variables used by the clients and vLLM engine:
 | `MX_REFIT_PREFETCH_POLL_SECONDS` | `2` | How often the prefetcher checks for new versions. |
 | `MX_REFIT_PREFETCH_WORKERS` | `min(8, CPU count)` | CPU workers the prefetcher uses to apply deltas while the engine serves. |
 | `MX_REFIT_PREFER_PREPARED` | `false` | Install a locally prepared target from object storage before trying a generator peer. |
-| `MX_REFIT_INPLACE` | `false` | Stage each prepared delta's nonzero XOR bytes and install the delta into live vLLM weights in place instead of reloading. See [In-place install](#in-place-install). |
+| `MX_REFIT_INPLACE` | `false` | Stage each prepared delta's nonzero XOR bytes and install the delta into live vLLM weights in place instead of reloading. A delta is verified and installed before the checkpoint files are rewritten. See [In-place install](#in-place-install). |
 | `MX_REFIT_INPLACE_DIRECT` | `true` | During an in-place install, XOR verified non-expert tensors straight into live weights instead of reloading their layers. |
 | `MX_REFIT_CHECKSUM_FORMAT` | `adler32` | Checksum algorithm written by canonical S3 trainers. |
 | `MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES` | `4294967296` (4 GiB) | Maximum tensor bytes grouped into one full-checkpoint safetensors object. |
@@ -273,13 +273,15 @@ from the canonical lineage. If an in-place delta fails, the running engine keeps
 its previous weights, the cache remains `UPDATING`, and initialization rebuilds
 the checkpoint before accepting another update.
 
-`state.json` records whether preparation is `READY` or `UPDATING` and protects
-against interrupted writes. `active.json` changes only after engine installation
-succeeds, so a failed download, reconstruction, or install retains the previous
-active engine version. The cache lock coordinates artifact mutations. The
-installation lock is held shared by concurrent co-located installers and
-exclusively by preparation, preventing another preparation from entering before
-activation.
+`state.json` records whether preparation is `READY`, `STAGED`, or `UPDATING` and
+protects against interrupted writes. A `STAGED` version is verified and staged,
+but its base's checkpoint files have not been rewritten yet; see
+[Install before rewrite](#install-before-rewrite). `active.json` changes only
+after engine installation succeeds, so a failed download, reconstruction, or
+install retains the previous active engine version. The cache lock coordinates
+artifact mutations. The installation lock is held shared by concurrent
+co-located installers and exclusively by preparation, preventing another
+preparation from entering before activation.
 
 ```text
 <refit_checkpoint_dir>/<URL-quoted-MX-model-name>/
@@ -287,6 +289,7 @@ activation.
   .install.lock
   active.json
   state.json
+  want.json
   full/
     v0/
       *.safetensors
@@ -689,6 +692,8 @@ sequenceDiagram
 - `MX_REFIT_PREFER_PREPARED=true` installs a prepared target from the local
   cache before trying a generator peer. Enable it when the local install is
   faster than a peer transfer of the whole model.
+- Activating a version asks the prefetcher to poll at once, so it can move the
+  head without waiting for its next interval.
 - The prefetcher writes its last outcome to `prefetch.json` in the model's cache
   directory. It runs at a lower CPU priority and exits with the engine process.
 
@@ -756,3 +761,40 @@ flowchart LR
 - A model qualifies when its processing only rearranges bits. Check a new model,
   quantization, or kernel backend by comparing an in-place install with a
   reload of the same target before enabling it.
+
+### Install before rewrite
+
+Rewriting the whole checkpoint for a dense delta takes as long as reading and
+writing every file, while the in-place install needs only the staged bytes. With
+`MX_REFIT_INPLACE=true` and an engine that installs staged checkpoints (vLLM),
+preparing one delta on the cache head therefore checks it first and leaves the
+rewrite for later:
+
+```mermaid
+stateDiagram-v2
+    READY --> STAGED: check the next delta
+    STAGED --> READY: rewrite the files while the engine serves
+    STAGED --> STAGED: rewrite and check the next delta in one pass
+```
+
+- On a `READY` head, one pass reads the head's files, XORs the delta, and checks
+  every target checksum without writing. It stages the delta's nonzero bytes,
+  and the target becomes the `STAGED` head, whose files still hold its base. A
+  delta that fails its checksums leaves the head `READY` and unchanged.
+- The engine installs a `STAGED` target from its staging. Where it must reload
+  instead, it reads the base's files with the staged bytes XORed in, so the
+  reload sees the target's bytes.
+- Once the engine has activated a `STAGED` head, the prefetcher writes the
+  staged bytes into the files, which makes the head `READY`. If a delta on top
+  of the head appears first, or arrives during that rewrite, the rest of the
+  rewrite and the new delta's check run as one pass, and the new delta becomes
+  the `STAGED` head on the rewritten files. The prefetcher sees such a delta in
+  the registry or the S3 watch, or from `want.json`, which an engine writes
+  while it waits to prepare a target.
+- Any other preparation, such as a chain of several deltas, or a caller that
+  needs the target's own files, writes a `STAGED` head into its files first.
+- While files are being rewritten, the head is `UPDATING`, so a crash makes the
+  next initialization rebuild it from its lineage.
+- `perf/mx_receive_delta_apply` is the time of the checking pass, and
+  `perf/mx_receive_delta_rewrite` the time spent rewriting the previous head
+  before a following delta joined the pass.

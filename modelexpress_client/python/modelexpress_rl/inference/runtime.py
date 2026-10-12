@@ -316,6 +316,10 @@ def initialize_generator_runtime(
                     rl_envs.MX_REFIT_FULL_STREAMING
                     and engine.installer.capabilities.streamed_checkpoints
                 ),
+                staged_checkpoints=(
+                    rl_envs.MX_REFIT_INPLACE
+                    and engine.installer.capabilities.staged_checkpoints
+                ),
             )
             methods.append(canonical_method)
         if any(
