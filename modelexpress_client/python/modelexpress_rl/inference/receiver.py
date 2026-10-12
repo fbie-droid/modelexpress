@@ -1185,6 +1185,8 @@ class _LocalCheckpoint:
 
         artifact = self.store.delta_path(version.version_id)
         download_started = time.perf_counter()
+        # A delta downloaded now applies from memory rather than from its copy on disk.
+        downloaded: dict[str, tuple[bytes, list[str]]] | None = None
         if artifact.exists():
             self.store.verify_artifact_source(
                 artifact,
@@ -1196,14 +1198,14 @@ class _LocalCheckpoint:
                 version.base_version_id,
                 version.version_id,
             )
-            shards = self._download_deltas(weight_map, version.uri)
+            downloaded = self._download_deltas(weight_map, version.uri)
             self.store.ensure_capacity(
-                len(index_data) + sum(len(data) for data, _names in shards.values()),
+                len(index_data) + sum(len(data) for data, _names in downloaded.values()),
                 protected_versions=protected_versions,
             )
             with self.store.replace_directory(artifact) as temporary:
                 (temporary / Path(version.uri).name).write_bytes(index_data)
-                for filename, (data, _names) in shards.items():
+                for filename, (data, _names) in downloaded.items():
                     (temporary / filename).write_bytes(data)
                 self.store.record_artifact(
                     temporary,
@@ -1240,7 +1242,9 @@ class _LocalCheckpoint:
             shutil.rmtree(target, ignore_errors=True)
             base_checkpoint.replace(target)
             self._set_local_checkpoint(target)
-            self._apply_delta_artifact(artifact, metadata, weight_map, sink=sink)
+            self._apply_delta_artifact(
+                artifact, metadata, weight_map, sink=sink, shards=downloaded
+            )
         else:
             # The first delta after a full checkpoint copies once so applying
             # it cannot modify the canonical full artifact.
@@ -1249,7 +1253,9 @@ class _LocalCheckpoint:
                 copy_from=base_checkpoint,
             ) as temporary:
                 self._set_local_checkpoint(temporary)
-                self._apply_delta_artifact(artifact, metadata, weight_map, sink=sink)
+                self._apply_delta_artifact(
+                    artifact, metadata, weight_map, sink=sink, shards=downloaded
+                )
 
         self._set_local_checkpoint(target)
         self.store.write_chain(version.version_id, chain)
@@ -1292,15 +1298,18 @@ class _LocalCheckpoint:
         *,
         verify: bool = True,
         sink: dict[str, tuple[int, np.ndarray, np.ndarray]] | None = None,
+        shards: dict[str, tuple[bytes, list[str]]] | None = None,
     ) -> None:
+        """Apply a recorded delta artifact, from ``shards`` when they hold its bytes."""
         self.store.verify_artifact(artifact)
-        shards = {
-            filename: (
-                (artifact / filename).read_bytes(),
-                names,
-            )
-            for filename, names in _group_tensors_by_shard(weight_map).items()
-        }
+        if shards is None:
+            shards = {
+                filename: (
+                    (artifact / filename).read_bytes(),
+                    names,
+                )
+                for filename, names in _group_tensors_by_shard(weight_map).items()
+            }
         self._apply_shards(
             shards, index_metadata=index_metadata, verify=verify, sink=sink
         )
