@@ -68,6 +68,20 @@ def test_staged_delta_round_trips_nonzero_bytes(tmp_path):
     staged.close()
 
 
+@pytest.mark.parametrize("density", [0.0, 0.01, 0.3, 1.0])
+@pytest.mark.parametrize("size", [0, 7, 8, 17, 4097])
+def test_nonzero_bytes_match_a_byte_scan_at_any_alignment(size, density):
+    rng = np.random.default_rng(size)
+    block = np.where(rng.random(size) < density, rng.integers(1, 256, size), 0).astype(np.uint8)
+    # Start one byte into a buffer, so 8-byte words are unaligned.
+    shifted = np.frombuffer(b"\0" + block.tobytes(), dtype=np.uint8)[1:]
+
+    positions, values = nonzero_bytes(shifted, 11)
+
+    assert positions.tolist() == (np.flatnonzero(block) + 11).tolist()
+    assert values.tolist() == block[block != 0].tolist()
+
+
 def test_staged_base_is_read_without_the_index(tmp_path):
     staged = _stage(
         tmp_path / "staging",

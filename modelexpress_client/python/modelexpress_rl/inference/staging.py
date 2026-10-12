@@ -32,8 +32,18 @@ def position_dtype(nbytes: int) -> np.dtype:
 
 def nonzero_bytes(block: np.ndarray, offset: int) -> tuple[np.ndarray, np.ndarray]:
     """Return absolute offsets and values of the nonzero bytes in one block."""
-    positions = np.flatnonzero(block)
-    return positions + offset, block[positions].copy()
+    # Most 8-byte words of a sparse delta are zero, and finding the nonzero
+    # words first scans an eighth as many elements as finding bytes.
+    whole = block.size - block.size % 8
+    words = np.flatnonzero(block[:whole].view(np.uint64))
+    if 2 * words.size > whole // 8:
+        positions = np.flatnonzero(block)
+    else:
+        rows, columns = np.nonzero(block[:whole].reshape(-1, 8)[words])
+        positions = words[rows] * 8 + columns
+        if whole < block.size:
+            positions = np.concatenate([positions, whole + np.flatnonzero(block[whole:])])
+    return positions + offset, block[positions]
 
 
 def join_nonzero(
