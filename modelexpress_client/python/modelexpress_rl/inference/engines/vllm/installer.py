@@ -48,6 +48,7 @@ from modelexpress_rl.inference.engines.vllm.stream_windows import (
 from modelexpress_rl.inference.engines.vllm.inplace import (
     InPlaceInstaller,
     InPlaceUnsupported,
+    Peers,
     xor_into,
     xor_restore,
 )
@@ -620,6 +621,23 @@ def _agree_with_peers(flags: torch.Tensor) -> torch.Tensor:
         agreed, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
     )
     return agreed
+
+
+def _tensor_parallel_peers() -> Peers | None:
+    """The tensor-parallel ranks of this pipeline stage, which share staged bytes."""
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        group = get_tp_group()
+    except (ImportError, AssertionError):
+        return None
+    if group.world_size == 1:
+        return None
+    return Peers(
+        group.rank_in_group,
+        group.world_size,
+        lambda tensor: group.all_gather(tensor, dim=0),
+    )
 
 
 class _VllmInstaller(EngineInstaller):
@@ -1210,6 +1228,7 @@ class _VllmInstaller(EngineInstaller):
                 capture_layout=self.capture_checkpoint_layout,
                 refresh_attention=self._refresh_attention,
                 agree=_agree_with_peers,
+                peers=_tensor_parallel_peers(),
             )
         try:
             metrics = self._inplace.install(checkpoint.path, checkpoint.staging)

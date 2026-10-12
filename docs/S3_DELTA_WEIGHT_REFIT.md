@@ -709,11 +709,16 @@ flowchart LR
   `kv_b_proj` weights. Processing the delta like weights and XORing the result
   into live storage therefore gives the same bytes as a reload of the target.
   Processing zeros as well cancels any constant part of the processing.
-- Routed-expert layers take a batched path: each rank scatters only its shard
-  of the staged bytes into the layer's load layout, then runs the layer's
-  post-load processing once. Every other changed tensor goes through the
-  layerwise reload with the final copy replaced by an XOR. That reload's inputs
-  are built on the GPU when it has room, rather than as host arrays.
+- Routed-expert layers take a batched path: the GPU places each rank's shard of
+  the staged bytes in the layer's load layout, then runs the layer's post-load
+  processing once. A layer's staged tensors are consecutive in the staging
+  files, so the install reads them in large runs on a few threads, ahead of
+  the GPU. Each tensor-parallel rank reads an equal part of every run and an
+  all-gather over the ranks assembles it, so each staged byte leaves host memory
+  once per node rather than once per rank. Every other changed tensor goes
+  through the layerwise reload with the final copy replaced by an XOR. That
+  reload's inputs are built on the GPU when it has room, rather than as host
+  arrays.
 - Most other tensors load as plain byte copies that processing leaves alone,
   so each rank can XOR its share of the staged bytes straight into live
   storage instead. The installer records where vLLM's loaders copy each tensor,
@@ -729,18 +734,21 @@ flowchart LR
 - Checkpoint headers are parsed once per process. Deltas never change them, so
   each update reuses the previous index. `perf/mx_receive_inplace_index_time`,
   `perf/mx_receive_inplace_plan_time`, `perf/mx_receive_inplace_expert_time`, and
-  `perf/mx_receive_inplace_generic_time` split the install, with
-  `perf/mx_receive_inplace_input_time` the part of the last spent building the
-  reload's inputs. `perf/mx_receive_inplace_direct_tensors` counts the tensors
-  XORed directly.
+  `perf/mx_receive_inplace_generic_time` split the install.
+  `perf/mx_receive_inplace_expert_wait_time` is the part of the expert time
+  spent waiting for staged bytes to be read, and
+  `perf/mx_receive_inplace_input_time` the part of the generic time spent
+  building the reload's inputs. `perf/mx_receive_inplace_direct_tensors` counts
+  the tensors XORed directly.
 - After the engine starts, it holds `initial_serving_version_id` when the
   orchestrator passes one, and otherwise `initial_base_version_id`. The first
   delta from that version installs in place, or surgically, without a full
   reload.
 - The update falls back to a reload when the engine does not hold the delta's
   base, when a layer is not supported (expert parallelism, an unexpected expert
-  tensor, or a layout mismatch), or when the staging is missing. Anything
-  already XORed belongs to a changed module, which the reload rewrites.
+  tensor, or a layout mismatch), or when the staging is missing or its files do
+  not match its index. Anything already XORed belongs to a changed module,
+  which the reload rewrites.
 - A model qualifies when its processing only rearranges bits. Check a new model,
   quantization, or kernel backend by comparing an in-place install with a
   reload of the same target before enabling it.

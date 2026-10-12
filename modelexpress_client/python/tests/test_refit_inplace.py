@@ -3,8 +3,10 @@
 
 """Staging of nonzero XOR bytes and in-place installation of deltas."""
 
+import functools
 import json
 import sys
+import threading
 from types import ModuleType, SimpleNamespace
 
 import numpy as np
@@ -20,6 +22,8 @@ from modelexpress_rl.inference.engines.vllm import installer as installer_module
 from modelexpress_rl.inference.plan import PreparedCheckpointArtifact
 from modelexpress_rl.inference.receiver import PreparedCheckpoint
 from modelexpress_rl.inference.staging import (
+    POSITIONS_FILE,
+    VALUES_FILE,
     StagedDelta,
     join_nonzero,
     nonzero_bytes,
@@ -294,45 +298,139 @@ def test_evicting_a_version_removes_its_staging(monkeypatch, tmp_path):
     assert not store.staging_path("v1").exists()
 
 
-@pytest.mark.parametrize("tp_size,tp_rank", [(1, 0), (2, 0), (2, 1)])
-@pytest.mark.parametrize("shard_rows", [True, False])
-@pytest.mark.parametrize("dtype", [torch.int32, torch.uint8])
-def test_expert_shards_match_the_dense_delta(tmp_path, tp_size, tp_rank, shard_rows, dtype):
-    generator = torch.Generator().manual_seed(7)
-    rows, cols, experts = 8, 6, 3
-    dense = []
-    tensors = {}
-    for expert in range(experts):
-        delta = torch.randint(0, 255, (rows, cols * torch.empty((), dtype=dtype).element_size()), generator=generator, dtype=torch.uint8)
-        delta[torch.rand(delta.shape, generator=generator) < 0.7] = 0
-        dense.append(delta.view(dtype).view(rows, cols))
-        tensors[f"e{expert}"] = (np.zeros(delta.numel(), dtype=np.uint8), delta.reshape(-1).numpy())
-    staged = _stage(tmp_path / "staging", tensors)
-    itemsize = torch.empty((), dtype=dtype).element_size()
-    shard = (rows // tp_size, cols) if shard_rows else (rows, cols // tp_size)
-    scratch = torch.zeros((experts, shard[0] * shard[1] * itemsize), dtype=torch.uint8)
+def test_staged_delta_reads_row_ranges_and_checks_file_sizes(tmp_path):
+    tensors = {
+        "a": (16, np.array([1, 3], dtype=np.uint32), np.array([7, 8], dtype=np.uint8)),
+        "b": (16, np.array([2], dtype=np.uint32), np.array([9], dtype=np.uint8)),
+    }
+    write_staging(tmp_path, base_version="base", tensors=tensors)
+    staged = StagedDelta(tmp_path)
 
-    inplace_module.scatter_expert_shards(
-        scratch,
-        staged,
-        ["e0", None, "e2"],
-        rows=rows,
-        cols=cols,
-        itemsize=itemsize,
-        shard_rows=shard_rows,
-        tp_size=tp_size,
-        tp_rank=tp_rank,
+    assert staged.row("b") == 1
+    assert staged.byte_ranges(0, 2) == ((0, 12), (0, 3))
+    assert staged.byte_ranges(1, 2) == ((8, 12), (2, 3))
+    out = bytearray(4)
+    staged.read_into(POSITIONS_FILE, 8, memoryview(out))
+    assert np.frombuffer(bytes(out), dtype=np.uint32).tolist() == [2]
+    staged.close()
+
+    with (tmp_path / VALUES_FILE).open("ab") as handle:
+        handle.write(b"\0")
+    with pytest.raises(ValueError, match="does not match"):
+        StagedDelta(tmp_path)
+    installer = inplace_module.InPlaceInstaller(
+        torch.nn.Module(), device=torch.device("cpu"), generic_reload=lambda load: None
     )
+    with pytest.raises(inplace_module.InPlaceUnsupported, match="does not match"):
+        installer.install(tmp_path / "checkpoint", tmp_path)
 
-    result = scratch.view(dtype).view(experts, *shard)
-    for expert in range(experts):
-        if expert == 1:
-            assert not result[expert].any()
-            continue
-        dim = 0 if shard_rows else 1
-        size = dense[expert].shape[dim] // tp_size
-        expected = dense[expert].narrow(dim, tp_rank * size, size)
-        assert torch.equal(result[expert], expected)
+
+def test_staged_runs_split_by_size_and_offset_width(tmp_path):
+    tensors = {
+        "a": (16, np.arange(4, dtype=np.uint32), np.ones(4, dtype=np.uint8)),
+        "b": (16, np.arange(3, dtype=np.uint32), np.ones(3, dtype=np.uint8)),
+        "c": (1 << 33, np.array([1 << 32], dtype=np.uint64), np.ones(1, dtype=np.uint8)),
+        "d": (16, np.arange(5, dtype=np.uint32), np.ones(5, dtype=np.uint8)),
+    }
+    write_staging(tmp_path, base_version="base", tensors=tensors)
+    staged = StagedDelta(tmp_path)
+
+    assert inplace_module.staged_runs(staged, 0, 4, limit=8) == [(0, 2), (2, 3), (3, 4)]
+    assert inplace_module.staged_runs(staged, 0, 2, limit=5) == [(0, 1), (1, 2)]
+    assert inplace_module.staged_runs(staged, 1, 1) == []
+    staged.close()
+
+
+class _Exchange:
+    """Ranks simulated by threads that all-gather through a barrier."""
+
+    def __init__(self, size):
+        self.size = size
+        self._barrier = threading.Barrier(size)
+        self._parts = [None] * size
+
+    def peers(self, rank):
+        def all_gather(tensor):
+            self._parts[rank] = tensor
+            self._barrier.wait()
+            gathered = torch.cat(self._parts)
+            self._barrier.wait()
+            return gathered
+
+        return inplace_module.Peers(rank, self.size, all_gather)
+
+
+@pytest.mark.parametrize("size", [2, 3])
+def test_peers_split_reads_and_deliver_whole_runs(tmp_path, size):
+    rng = np.random.default_rng(5)
+    tensors = {}
+    for index, nbytes in enumerate((64, 9, 33, 128)):
+        after = rng.integers(1, 256, nbytes, dtype=np.uint8)
+        after[rng.random(nbytes) < 0.6] = 0
+        tensors[f"t{index}"] = (np.zeros(nbytes, dtype=np.uint8), after)
+    # A row with no staged bytes forms an empty run.
+    tensors["t4"] = (np.zeros(8, dtype=np.uint8), np.zeros(8, dtype=np.uint8))
+    staged = _stage(tmp_path / "staging", tensors)
+    runs = inplace_module.staged_runs(staged, 0, 5, limit=20)
+    assert runs[-1] == (4, 5)
+    cpu = torch.device("cpu")
+    reader = inplace_module.StagedRunReader(staged, runs, cpu, piece=8, depth=2)
+    expected = list(reader)
+    reader.close()
+    exchange = _Exchange(size)
+    delivered = [None] * size
+
+    def read(rank):
+        peer = inplace_module.StagedRunReader(
+            staged, runs, cpu, peers=exchange.peers(rank), piece=8, depth=2
+        )
+        delivered[rank] = list(peer)
+        peer.close()
+
+    threads = [threading.Thread(target=read, args=(rank,)) for rank in range(size)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    for run in expected:
+        rows = [staged.tensor(f"t{row}") for row in range(run.begin, run.end)]
+        offsets = np.concatenate([row.positions for row in rows]).astype(np.int64)
+        values = np.concatenate([row.values for row in rows])
+        assert run.offsets.to(torch.int64).tolist() == offsets.tolist()
+        assert run.values.tolist() == values.tolist()
+    for runs_of_rank in delivered:
+        assert [(run.begin, run.end) for run in runs_of_rank] == runs
+        for got, want in zip(runs_of_rank, expected):
+            assert torch.equal(got.offsets, want.offsets)
+            assert torch.equal(got.values, want.values)
+    staged.close()
+
+
+def test_runs_place_narrow_and_wide_offsets(tmp_path):
+    tensors = {
+        "a": (16, np.array([2, 5], dtype=np.uint32), np.array([1, 2], dtype=np.uint8)),
+        "b": (1 << 33, np.array([1, (1 << 32) + 3], dtype=np.uint64), np.array([3, 4], dtype=np.uint8)),
+    }
+    write_staging(tmp_path, base_version="base", tensors=tensors)
+    staged = StagedDelta(tmp_path)
+    runs = inplace_module.staged_runs(staged, 0, 2)
+    assert runs == [(0, 1), (1, 2)]
+    cpu = torch.device("cpu")
+    flat = torch.zeros(32 + inplace_module._DISCARD_BYTES, dtype=torch.uint8)
+    # a: two-byte columns from byte 1 of each four-byte row; b: its first 16
+    # bytes as one range at 16, so its byte past 4 GiB is discarded.
+    rules = {0: (0, 4, 2, 1), 1: (16, inplace_module._ONE_ROW, 16, 0)}
+    placement = inplace_module.StagedPlacement(staged, (0, 2), rules, 32, cpu)
+
+    reader = inplace_module.StagedRunReader(staged, runs, cpu)
+    for run in reader:
+        placement.place(flat, run, window=1)
+    reader.close()
+
+    expected = torch.zeros(32, dtype=torch.uint8)
+    expected[1], expected[2], expected[17] = 1, 2, 3
+    assert torch.equal(flat[:32], expected)
     staged.close()
 
 
@@ -425,6 +523,73 @@ def test_packed_experts_may_load_into_plain_weight_parameters(monkeypatch, tmp_p
     expected = torch.stack([torch.cat([dense[(e, "w1")], dense[(e, "w3")]]) for e in range(experts)])
     assert torch.equal(arranged["w13_weight"], expected)
     assert torch.equal(arranged["w2_weight"], torch.stack([dense[(e, "w2")] for e in range(experts)]))
+    staged.close()
+
+
+def test_expert_layers_install_from_one_reader(monkeypatch, tmp_path):
+    experts, out, inner = 2, 4, 6
+    generator = torch.Generator().manual_seed(11)
+
+    def random(shape):
+        return torch.randint(-(2**31), 2**31 - 1, shape, generator=generator, dtype=torch.int32)
+
+    class RoutedExperts(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w13_weight = torch.nn.Parameter(random((experts, 2 * out, inner)), requires_grad=False)
+            self.w2_weight = torch.nn.Parameter(random((experts, inner, out)), requires_grad=False)
+            self.moe_config = SimpleNamespace(
+                moe_parallel_config=SimpleNamespace(tp_size=1, ep_size=1), tp_rank=0
+            )
+            self.quant_method = SimpleNamespace()
+
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList([torch.nn.Module() for _ in range(2)])
+    for layer in model.layers:
+        layer.mlp = torch.nn.Module()
+        layer.mlp.experts = RoutedExperts()
+    monkeypatch.setattr(inplace_module, "_routed_experts_class", lambda: RoutedExperts)
+    _fake_layerwise(
+        monkeypatch,
+        {
+            "w13_weight": torch.empty((experts, 2 * out, inner), dtype=torch.int32, device="meta"),
+            "w2_weight": torch.empty((experts, inner, out), dtype=torch.int32, device="meta"),
+        },
+    )
+    # Processing that keeps the loaded layout.
+    monkeypatch.setattr(inplace_module, "process_like_weights", lambda _layer, arranged: arranged)
+    # Runs of a few rows each, so layers span several runs of one reader.
+    monkeypatch.setattr(
+        inplace_module, "staged_runs", functools.partial(inplace_module.staged_runs, limit=64)
+    )
+    deltas, checkpoint_tensors, tensors = {}, {}, {}
+    for index in range(2):
+        for expert in range(experts):
+            for proj, shape in (("gate", (out, inner)), ("up", (out, inner)), ("down", (inner, out))):
+                name = f"model.layers.{index}.mlp.experts.{expert}.{proj}_proj.weight"
+                delta = random(shape)
+                delta[torch.rand(shape, generator=generator) < 0.5] = 0
+                deltas[(index, expert, proj)] = delta
+                checkpoint_tensors[name] = torch.zeros(shape, dtype=torch.int32)
+                tensors[name] = (np.zeros(delta.numel() * 4, dtype=np.uint8), delta.reshape(-1).view(torch.uint8).numpy())
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    save_file(checkpoint_tensors, checkpoint / "model.safetensors")
+    staged = _stage(tmp_path / "staging", tensors)
+    before = [(layer.mlp.experts.w13_weight.clone(), layer.mlp.experts.w2_weight.clone()) for layer in model.layers]
+    installer = inplace_module.InPlaceInstaller(model, device=torch.device("cpu"), generic_reload=lambda load: None)
+
+    metrics = installer._install(checkpoint, staged)
+
+    assert metrics["perf/mx_receive_inplace_expert_layers"] == 2
+    for index, layer in enumerate(model.layers):
+        w13, w2 = before[index]
+        gate_up = torch.stack(
+            [torch.cat([deltas[(index, e, "gate")], deltas[(index, e, "up")]]) for e in range(experts)]
+        )
+        down = torch.stack([deltas[(index, e, "down")] for e in range(experts)])
+        assert torch.equal(layer.mlp.experts.w13_weight, w13 ^ gate_up)
+        assert torch.equal(layer.mlp.experts.w2_weight, w2 ^ down)
     staged.close()
 
 
@@ -639,7 +804,9 @@ class _InPlace:
     calls = []
     error = None
 
-    def __init__(self, model, *, device, generic_reload, capture_layout, refresh_attention, agree):
+    def __init__(
+        self, model, *, device, generic_reload, capture_layout, refresh_attention, agree, peers
+    ):
         pass
 
     def install(self, path, staging):

@@ -13,6 +13,7 @@ replaced by an XOR.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import math
 import re
@@ -20,6 +21,7 @@ import time
 import warnings
 from collections import defaultdict
 from collections.abc import Callable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,7 +33,12 @@ import torch
 from modelexpress.refit.reshard.slice_plan import resolve_slice
 from modelexpress.refit.reshard.types import UnsupportedReshard
 from modelexpress_rl import envs as rl_envs
-from modelexpress_rl.inference.staging import StagedDelta, StagedTensor
+from modelexpress_rl.inference.staging import (
+    POSITIONS_FILE,
+    VALUES_FILE,
+    StagedDelta,
+    StagedTensor,
+)
 from modelexpress_rl.utils import index_checkpoint_tensors
 
 logger = logging.getLogger(__name__)
@@ -158,82 +165,252 @@ def staged_bytes(
     return data
 
 
-def shard_nonzero(
-    positions: np.ndarray,
-    *,
-    rows: int,
-    row_bytes: int,
-    shard_rows: bool,
-    tp_size: int,
-    tp_rank: int,
-) -> tuple[slice, int]:
-    """Return the slice of sorted offsets in this rank's row shard and its start.
+@dataclass(frozen=True)
+class Peers:
+    """Ranks that split reading staged bytes, then gather what each read."""
 
-    Column shards cannot be selected by one slice; callers filter them instead.
+    rank: int
+    size: int
+    # Concatenates every peer's equally sized tensor along dimension 0, in rank order.
+    all_gather: Callable[[torch.Tensor], torch.Tensor]
+
+
+# Staged bytes per run that ranks read and gather, and per pass that places them.
+_RUN_BYTES = 1 << 25
+_PLACE_BYTES = 1 << 23
+# Where placement writes the bytes outside this rank's shard.
+_DISCARD_BYTES = 1 << 20
+# A row length that keeps every offset of a tensor in row zero.
+_ONE_ROW = 1 << 62
+
+
+def staged_runs(
+    staged: StagedDelta, begin: int, end: int, *, limit: int = _RUN_BYTES
+) -> list[tuple[int, int]]:
+    """Split rows ``[begin, end)`` into runs of about ``limit`` staged bytes.
+
+    A run never mixes offset widths, so its offsets read as one integer type.
     """
-    if not shard_rows:
-        return slice(0, positions.size), 0
-    shard_bytes = rows // tp_size * row_bytes
-    begin = tp_rank * shard_bytes
-    first, last = np.searchsorted(positions, [begin, begin + shard_bytes])
-    return slice(int(first), int(last)), begin
+    runs = []
+    counts = staged.counts(begin, end)
+    start, total = begin, 0
+    for row, count in enumerate(counts.tolist(), begin):
+        if row > start and (
+            total + count > limit or staged.offset_width(row) != staged.offset_width(start)
+        ):
+            runs.append((start, row))
+            start, total = row, 0
+        total += count
+    if end > begin:
+        runs.append((start, end))
+    return runs
 
 
-def scatter_expert_shards(
-    scratch: torch.Tensor,
-    staged: StagedDelta,
-    names: list[str | None],
-    *,
-    rows: int,
-    cols: int,
-    itemsize: int,
-    shard_rows: bool,
-    tp_size: int,
-    tp_rank: int,
-) -> None:
-    """Write this rank's shard of every expert's XOR bytes into ``scratch``.
+@dataclass(frozen=True)
+class StagedRun:
+    """Offsets and values of consecutive staged rows, on the install device."""
 
-    ``scratch`` is uint8 ``[experts, shard_bytes]`` and ``names[e]`` names expert
-    ``e``'s checkpoint tensor, or ``None`` when it is unchanged.
+    begin: int
+    end: int
+    offsets: torch.Tensor
+    values: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _Share:
+    """One rank's part of a run: equal slices of its offset and value bytes."""
+
+    positions: tuple[int, int]
+    values: tuple[int, int]
+    # Bytes per peer of each file, padded so every peer sends the same size.
+    positions_part: int
+    values_part: int
+    run_bytes: tuple[int, int]
+
+
+class StagedRunReader:
+    """Deliver runs of staged rows to a device in order, read ahead by threads.
+
+    With peers, each rank reads an equal share of a run's bytes and an
+    all-gather assembles the run, so each staged byte crosses host memory once
+    per peer group rather than once per rank. Peers must read the same runs.
     """
-    row_bytes = cols * itemsize
-    shard_bytes = scratch.shape[1]
-    positions, values, experts, counts, offsets = [], [], [], [], []
-    for expert, name in enumerate(names):
-        if name is None:
-            continue
-        tensor = staged.tensor(name)
-        selected, begin = shard_nonzero(
-            tensor.positions,
-            rows=rows,
-            row_bytes=row_bytes,
-            shard_rows=shard_rows,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+
+    def __init__(
+        self,
+        staged: StagedDelta,
+        runs: list[tuple[int, int]],
+        device: torch.device,
+        *,
+        peers: Peers | None = None,
+        threads: int = 8,
+        depth: int = 4,
+        piece: int = 1 << 21,
+    ) -> None:
+        self._staged = staged
+        self._runs = runs
+        self._device = device
+        self._peers = peers
+        self._piece = piece
+        self._shares = [self._share(begin, end) for begin, end in runs]
+        capacity = max(
+            (share.positions_part + share.values_part for share in self._shares), default=0
         )
-        count = selected.stop - selected.start
-        if count <= 0:
-            continue
-        positions.append(tensor.positions[selected])
-        values.append(tensor.values[selected])
-        experts.append(expert)
-        counts.append(count)
-        offsets.append(begin)
-    if not positions:
-        return
-    device = scratch.device
-    offset = device_offsets(np.concatenate(positions), device)
-    value = torch.from_numpy(np.concatenate(values)).to(device)
-    repeat = torch.tensor(counts, device=device)
-    expert = torch.repeat_interleave(torch.tensor(experts, device=device), repeat)
-    offset = offset - torch.repeat_interleave(torch.tensor(offsets, device=device), repeat)
-    if not shard_rows:
-        shard_row_bytes = row_bytes // tp_size
-        column = offset % row_bytes - tp_rank * shard_row_bytes
-        keep = (column >= 0) & (column < shard_row_bytes)
-        offset = (offset // row_bytes) * shard_row_bytes + column
-        offset, value, expert = offset[keep], value[keep], expert[keep]
-    scratch.view(-1)[expert * shard_bytes + offset] = value
+        pin = device.type == "cuda"
+        self._buffers = [
+            torch.empty(capacity, dtype=torch.uint8, pin_memory=pin)
+            for _ in range(min(depth, len(runs)))
+        ]
+        # The copy out of each buffer, which a read into it must wait for.
+        self._copies: list[torch.cuda.Event | None] = [None] * len(self._buffers)
+        self._pool = ThreadPoolExecutor(threads, thread_name_prefix="mx-staged-read")
+        self._reads: dict[int, list[Future]] = {}
+        self._submitted = 0
+        self._delivered = 0
+        # Time spent waiting for reads, behind the device.
+        self.wait_seconds = 0.0
+        for _ in self._buffers:
+            self._submit()
+
+    def _share(self, begin: int, end: int) -> _Share:
+        rank, size = (self._peers.rank, self._peers.size) if self._peers else (0, 1)
+        positions, values = self._staged.byte_ranges(begin, end)
+        mine, parts = [], []
+        for low, high in (positions, values):
+            part = -(-(high - low) // size // 16) * 16
+            start = min(low + rank * part, high)
+            mine.append((start, min(start + part, high)))
+            parts.append(part)
+        lengths = (positions[1] - positions[0], values[1] - values[0])
+        return _Share(mine[0], mine[1], parts[0], parts[1], lengths)
+
+    def _submit(self) -> None:
+        index = self._submitted
+        if index >= len(self._runs):
+            return
+        self._submitted += 1
+        slot = index % len(self._buffers)
+        share = self._shares[index]
+        view = memoryview(self._buffers[slot].numpy())
+        copy = self._copies[slot]
+        reads = []
+        for file, (low, high), start in (
+            (POSITIONS_FILE, share.positions, 0),
+            (VALUES_FILE, share.values, share.positions_part),
+        ):
+            for offset in range(low, high, self._piece):
+                stop = min(offset + self._piece, high)
+                target = view[start + offset - low : start + stop - low]
+                reads.append(self._pool.submit(self._read, copy, file, offset, target))
+        self._reads[index] = reads
+
+    def _read(self, copy: Any, file: str, offset: int, target: memoryview) -> None:
+        if copy is not None:
+            copy.synchronize()
+        self._staged.read_into(file, offset, target)
+
+    def __iter__(self) -> StagedRunReader:
+        return self
+
+    def __next__(self) -> StagedRun:
+        index = self._delivered
+        if index >= len(self._runs):
+            raise StopIteration
+        started = time.perf_counter()
+        for read in self._reads.pop(index):
+            read.result()
+        self.wait_seconds += time.perf_counter() - started
+        self._delivered += 1
+        slot = index % len(self._buffers)
+        share = self._shares[index]
+        width = share.positions_part + share.values_part
+        begin, end = self._runs[index]
+        if width == 0:
+            # Every peer sees the same empty run, so none gathers it.
+            self._submit()
+            empty = torch.empty(0, dtype=torch.uint8, device=self._device)
+            return StagedRun(begin, end, empty.view(torch.int32), empty)
+        host = self._buffers[slot][:width]
+        if self._device.type == "cuda":
+            local = host.to(self._device, non_blocking=True)
+            copy = torch.cuda.Event()
+            copy.record()
+            self._copies[slot] = copy
+        else:
+            local = host.to(self._device, copy=True)
+        self._submit()
+        rows = (self._peers.all_gather(local) if self._peers else local).view(-1, width)
+        positions_bytes, values_bytes = share.run_bytes
+        offsets = rows[:, : share.positions_part].reshape(-1)[:positions_bytes]
+        values = rows[:, share.positions_part :].reshape(-1)[:values_bytes]
+        if self._staged.offset_width(begin) == 4:
+            offsets = offsets.view(torch.int32)
+        else:
+            offsets = offsets.view(torch.int64)
+        return StagedRun(begin, end, offsets, values)
+
+    def close(self) -> None:
+        self._pool.shutdown(wait=True, cancel_futures=True)
+        self._reads.clear()
+
+
+def _to_device(array: np.ndarray, device: torch.device) -> torch.Tensor:
+    """Copy a small host array to ``device`` without waiting for queued work."""
+    tensor = torch.from_numpy(np.ascontiguousarray(array))
+    if device.type == "cuda":
+        return tensor.pin_memory().to(device, non_blocking=True)
+    return tensor.to(device)
+
+
+class StagedPlacement:
+    """Where the staged bytes of consecutive rows land in a layer's flat buffer.
+
+    ``rules`` maps a row to ``(base, row_bytes, width, low)``: byte ``p`` of the
+    row lands at ``base + p // row_bytes * width + c`` where ``c`` is
+    ``p % row_bytes - low``, when ``0 <= c < width``. Rows without a rule, and
+    bytes outside this rank's shard, go to the ``_DISCARD_BYTES`` after ``size``.
+    """
+
+    def __init__(
+        self,
+        staged: StagedDelta,
+        rows: tuple[int, int],
+        rules: dict[int, tuple[int, int, int, int]],
+        size: int,
+        device: torch.device,
+    ) -> None:
+        begin, end = rows
+        table = np.array(
+            [rules.get(row, (0, 1, 0, 0)) for row in range(begin, end)], dtype=np.int64
+        )
+        self._begin = begin
+        self._size = size
+        # One column per rule field, each indexed by row.
+        self._columns = _to_device(table.reshape(-1, 4).T, device)
+        self._counts = _to_device(staged.counts(begin, end), device)
+
+    def place(self, flat: torch.Tensor, run: StagedRun, *, window: int = _PLACE_BYTES) -> None:
+        low, high = run.begin - self._begin, run.end - self._begin
+        total = run.values.numel()
+        rows = torch.repeat_interleave(
+            torch.arange(high - low, dtype=torch.int32, device=flat.device),
+            self._counts[low:high],
+            output_size=total,
+        )
+        columns = self._columns[:, low:high]
+        for start in range(0, total, window):
+            stop = min(start + window, total)
+            ids = rows[start:stop]
+            base, row_bytes, width, column_low = (columns[field][ids] for field in range(4))
+            offsets = run.offsets[start:stop].to(torch.int64)
+            if run.offsets.dtype == torch.int32:
+                offsets &= 0xFFFFFFFF
+            row = torch.div(offsets, row_bytes, rounding_mode="floor")
+            column = offsets - row * row_bytes - column_low
+            keep = (column >= 0) & (column < width)
+            discard = self._size + (offsets & (_DISCARD_BYTES - 1))
+            target = torch.where(keep, base + row * width + column, discard)
+            flat.index_put_((target,), run.values[start:stop])
 
 
 @dataclass(frozen=True)
@@ -382,6 +559,14 @@ def _expert_param(meta: dict, prefix: str, kind: str) -> str | None:
     return next((name for name in names if name in meta), None)
 
 
+def expert_rows(
+    staged: StagedDelta, expert_names: dict[tuple[int, str, str], str]
+) -> tuple[int, int] | None:
+    """Rows ``[begin, end)`` that span one layer's staged expert tensors."""
+    rows = [staged.row(name) for name in expert_names.values() if name in staged]
+    return (min(rows), max(rows) + 1) if rows else None
+
+
 def arrange_expert_delta(
     layer: torch.nn.Module,
     staged: StagedDelta,
@@ -389,12 +574,14 @@ def arrange_expert_delta(
     metadata: dict[str, dict],
     *,
     device: torch.device,
+    runs: Iterator[StagedRun] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Lay out one layer's expert XOR bytes as its pre-processing parameters.
 
     Gate and up shard their output rows, down shards its input columns, and the
     loader transposes packed weights when the parameter says so, as vLLM's
-    routed-expert weight loader does.
+    routed-expert weight loader does. ``runs`` delivers the rows of
+    ``expert_rows``; without it, this reads them.
     """
     from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
 
@@ -417,9 +604,11 @@ def arrange_expert_delta(
     first = next(iter(params.values()))[0]
     transposed = bool(getattr(meta[first], "is_transposed", False))
     experts = meta[first].shape[0]
-    arranged: dict[str, torch.Tensor] = {}
-    for kind, (w13_name, w2_name) in params.items():
-        parts = {}
+    # Every projection of every kind gets one slot of ``flat``, one shard per expert.
+    slots: dict[tuple[str, str], tuple[int, tuple[int, int], torch.dtype]] = {}
+    rules: dict[int, tuple[int, int, int, int]] = {}
+    size = 0
+    for kind in params:
         for proj in ("gate", "up", "down"):
             sample = expert_names.get((0, proj, kind))
             if sample is None or len(metadata[sample]["shape"]) != 2:
@@ -427,22 +616,44 @@ def arrange_expert_delta(
             rows, cols = metadata[sample]["shape"]
             dtype = _TORCH_DTYPES[metadata[sample]["dtype"]]
             itemsize = torch.empty((), dtype=dtype).element_size()
-            shard_rows = proj != "down"
-            shard = (rows // tp_size, cols) if shard_rows else (rows, cols // tp_size)
-            scratch = torch.zeros((experts, shard[0] * shard[1] * itemsize), dtype=torch.uint8, device=device)
-            names = [expert_names.get((expert, proj, kind)) for expert in range(experts)]
-            scatter_expert_shards(
-                scratch,
-                staged,
-                [name if name in staged else None for name in names],
-                rows=rows,
-                cols=cols,
-                itemsize=itemsize,
-                shard_rows=shard_rows,
-                tp_size=tp_size,
-                tp_rank=tp_rank,
-            )
-            tensor = scratch.view(dtype).view(experts, *shard)
+            if proj != "down":
+                shard = (rows // tp_size, cols)
+                shard_bytes = shard[0] * cols * itemsize
+                # One byte range per expert, so every offset is in row zero.
+                rule = (_ONE_ROW, shard_bytes, tp_rank * shard_bytes)
+            else:
+                shard = (rows, cols // tp_size)
+                width = shard[1] * itemsize
+                shard_bytes = rows * width
+                rule = (cols * itemsize, width, tp_rank * width)
+            size = -(-size // 256) * 256
+            slots[(kind, proj)] = (size, shard, dtype)
+            for expert in range(experts):
+                name = expert_names.get((expert, proj, kind))
+                if name in staged:
+                    rules[staged.row(name)] = (size + expert * shard_bytes, *rule)
+            size += experts * shard_bytes
+    flat = torch.zeros(size + _DISCARD_BYTES, dtype=torch.uint8, device=device)
+    span = expert_rows(staged, expert_names)
+    if span is not None:
+        placement = StagedPlacement(staged, span, rules, size, device)
+        reader = None
+        if runs is None:
+            reader = StagedRunReader(staged, staged_runs(staged, *span), device)
+            runs = reader
+        try:
+            for run in runs:
+                placement.place(flat, run)
+        finally:
+            if reader is not None:
+                reader.close()
+    arranged: dict[str, torch.Tensor] = {}
+    for kind, (w13_name, w2_name) in params.items():
+        parts = {}
+        for proj in ("gate", "up", "down"):
+            base, shard, dtype = slots[(kind, proj)]
+            nbytes = experts * shard[0] * shard[1] * torch.empty((), dtype=dtype).element_size()
+            tensor = flat[base : base + nbytes].view(dtype).view(experts, *shard)
             parts[proj] = tensor.transpose(1, 2) if transposed else tensor
         w13 = torch.cat([parts["gate"], parts["up"]], dim=2 if transposed else 1).contiguous()
         for name, tensor in ((w13_name, w13), (w2_name, parts["down"].contiguous())):
@@ -555,10 +766,13 @@ class InPlaceInstaller:
         | None = None,
         refresh_attention: Callable[[list[torch.nn.Module]], None] | None = None,
         agree: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        peers: Peers | None = None,
     ) -> None:
         self._model = model
         self._device = device
         self._generic_reload = generic_reload
+        # Ranks that split reading staged expert bytes.
+        self._peers = peers
         # Direct XOR needs the load layout and a way to rerun attention processing.
         self._capture_layout = capture_layout
         self._refresh_attention = refresh_attention
@@ -591,7 +805,10 @@ class InPlaceInstaller:
 
     def install(self, checkpoint: str | Path, staging: Path) -> dict[str, float]:
         started = time.perf_counter()
-        staged = StagedDelta(staging)
+        try:
+            staged = StagedDelta(staging)
+        except ValueError as error:
+            raise InPlaceUnsupported(str(error)) from error
         try:
             with _quiet_readonly_buffers():
                 metrics = self._install(checkpoint, staged)
@@ -626,10 +843,28 @@ class InPlaceInstaller:
         plan_seconds = time.perf_counter() - plan_started
 
         expert_started = time.perf_counter()
+        layer_runs = {}
         for index in expert_layers:
-            self._install_experts(
-                self._experts[index], staged, catalog.experts.get(index, {}), metadata
-            )
+            span = expert_rows(staged, catalog.experts.get(index, {}))
+            layer_runs[index] = staged_runs(staged, *span) if span else []
+        # One reader for every layer, so reads run ahead across layers.
+        reader = StagedRunReader(
+            staged,
+            [run for index in expert_layers for run in layer_runs[index]],
+            self._device,
+            peers=self._peers,
+        )
+        try:
+            for index in expert_layers:
+                self._install_experts(
+                    self._experts[index],
+                    staged,
+                    catalog.experts.get(index, {}),
+                    metadata,
+                    itertools.islice(reader, len(layer_runs[index])),
+                )
+        finally:
+            reader.close()
         _synchronize(self._device)
         expert_seconds = time.perf_counter() - expert_started
 
@@ -642,6 +877,7 @@ class InPlaceInstaller:
             "perf/mx_receive_inplace_plan_time": plan_seconds,
             "perf/mx_receive_inplace_expert_layers": float(len(expert_layers)),
             "perf/mx_receive_inplace_expert_time": expert_seconds,
+            "perf/mx_receive_inplace_expert_wait_time": reader.wait_seconds,
             "perf/mx_receive_inplace_generic_tensors": float(fed),
             "perf/mx_receive_inplace_input_time": self._input_seconds,
             "perf/mx_receive_inplace_direct_tensors": float(direct),
@@ -664,8 +900,11 @@ class InPlaceInstaller:
         staged: StagedDelta,
         expert_names: dict[tuple[int, str, str], str],
         metadata: dict[str, dict],
+        runs: Iterator[StagedRun],
     ) -> None:
-        arranged = arrange_expert_delta(layer, staged, expert_names, metadata, device=self._device)
+        arranged = arrange_expert_delta(
+            layer, staged, expert_names, metadata, device=self._device, runs=runs
+        )
         signature = (
             type(layer.quant_method).__name__,
             tuple((name, tuple(tensor.shape), tensor.dtype) for name, tensor in sorted(arranged.items())),
@@ -1062,16 +1301,20 @@ __all__ = [
     "DirectCopy",
     "InPlaceInstaller",
     "InPlaceUnsupported",
+    "Peers",
+    "StagedPlacement",
+    "StagedRun",
+    "StagedRunReader",
     "arrange_expert_delta",
     "bits",
     "direct_copies",
     "direct_region",
+    "expert_rows",
     "process_like_weights",
     "raw_bytes",
     "routed_expert_layers",
-    "scatter_expert_shards",
-    "shard_nonzero",
     "staged_bytes",
+    "staged_runs",
     "xor_direct",
     "xor_into",
     "xor_restore",

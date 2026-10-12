@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import mmap
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -85,7 +86,11 @@ class StagedTensor:
 
 
 class StagedDelta:
-    """Read-only view of a staged delta."""
+    """Read-only view of a staged delta.
+
+    Tensors are rows in name order, so one layer's tensors are consecutive rows
+    and their bytes are one range of each file.
+    """
 
     def __init__(self, directory: Path) -> None:
         index = json.loads((directory / INDEX_FILE).read_text())
@@ -96,12 +101,22 @@ class StagedDelta:
         self._rows = {name: row for row, name in enumerate(self._names)}
         self._nbytes = np.asarray(index["nbytes"], dtype=np.int64)
         self._counts = np.asarray(index["counts"], dtype=np.int64)
-        itemsizes = np.where(self._nbytes <= _UINT32_LIMIT, 4, 8)
-        self._position_offsets = _starts(self._counts * itemsizes)
+        self._widths = np.where(self._nbytes <= _UINT32_LIMIT, 4, 8)
+        self._position_offsets = _starts(self._counts * self._widths)
         self._value_offsets = _starts(self._counts)
+        sizes = {
+            POSITIONS_FILE: int((self._counts * self._widths).sum()),
+            VALUES_FILE: int(self._counts.sum()),
+        }
+        for name, size in sizes.items():
+            if (directory / name).stat().st_size != size:
+                raise ValueError(f"staged {name} does not match its index")
         self._maps = []
         self._positions = self._map(directory / POSITIONS_FILE)
         self._values = self._map(directory / VALUES_FILE)
+        self._files = {
+            name: os.open(directory / name, os.O_RDONLY) for name in (POSITIONS_FILE, VALUES_FILE)
+        }
 
     def _map(self, path: Path) -> memoryview:
         if path.stat().st_size == 0:
@@ -140,8 +155,41 @@ class StagedDelta:
         )
         return StagedTensor(nbytes, positions, values)
 
+    def row(self, name: str) -> int:
+        return self._rows[name]
+
+    def counts(self, begin: int, end: int) -> np.ndarray:
+        """Staged byte counts of rows ``[begin, end)``."""
+        return self._counts[begin:end]
+
+    def offset_width(self, row: int) -> int:
+        """Bytes per staged offset of one row."""
+        return int(self._widths[row])
+
+    def byte_ranges(self, begin: int, end: int) -> tuple[tuple[int, int], tuple[int, int]]:
+        """Ranges of rows ``[begin, end)`` in the offsets file and the values file."""
+        last = end - 1
+        positions_end = self._position_offsets[last] + self._counts[last] * self._widths[last]
+        values_end = self._value_offsets[last] + self._counts[last]
+        return (
+            (int(self._position_offsets[begin]), int(positions_end)),
+            (int(self._value_offsets[begin]), int(values_end)),
+        )
+
+    def read_into(self, file: str, offset: int, out: memoryview) -> None:
+        """Read ``len(out)`` bytes of ``file``, POSITIONS_FILE or VALUES_FILE, at ``offset``."""
+        done = 0
+        while done < len(out):
+            read = os.preadv(self._files[file], [out[done:]], offset + done)
+            if read <= 0:
+                raise OSError(f"staged {file} ended at byte {offset + done}")
+            done += read
+
     def close(self) -> None:
         """Unmap the files once no array still views them."""
+        for descriptor in self._files.values():
+            os.close(descriptor)
+        self._files.clear()
         try:
             self._positions.release()
             self._values.release()
