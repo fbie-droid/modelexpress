@@ -1111,7 +1111,12 @@ behavior and the related settings.
 weights in place instead of reloading every tensor; see
 [In-place install](S3_DELTA_WEIGHT_REFIT.md#in-place-install). There,
 `MX_REFIT_INPLACE_DIRECT` (default `true`) XORs verified non-expert tensors
-straight into live weights.
+straight into live weights. Deltas are installed before the checkpoint files are
+rewritten, and `MX_REFIT_STAGED_LAYERS` (default `8`) bounds how many wait on
+the files at once. Writing them while the engine serves needs a filesystem with
+reflinks and room in `refit_checkpoint_max_size_gb` for one more copy of the
+checkpoint files; see
+[Install before rewrite](S3_DELTA_WEIGHT_REFIT.md#install-before-rewrite).
 
 S3 versions normally use `XOR_DELTA`. Integrations may opt into a
 framework-selected cadence of `FULL_HF_CHECKPOINT` versions; these publish

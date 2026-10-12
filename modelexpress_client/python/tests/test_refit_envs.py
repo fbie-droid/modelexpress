@@ -36,6 +36,7 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_S3_TCP_KEEPALIVE is True
     assert envs.MX_REFIT_STREAM_WINDOW_LAYERS == 2
     assert envs.MX_REFIT_DELTA_SURGICAL is False
+    assert envs.MX_REFIT_STAGED_LAYERS == 8
 
 
 def test_values_are_normalized_and_read_live(monkeypatch):
@@ -59,6 +60,7 @@ def test_values_are_normalized_and_read_live(monkeypatch):
     monkeypatch.setenv("MX_S3_MAX_POOL_CONNECTIONS", "6")
     monkeypatch.setenv("MX_S3_MAX_ATTEMPTS", "7")
     monkeypatch.setenv("MX_S3_TCP_KEEPALIVE", "off")
+    monkeypatch.setenv("MX_REFIT_STAGED_LAYERS", "2")
 
     assert envs.MX_REFIT_METADATA_PORT == 8000
     assert envs.MX_TRAINER_STAGING_MODE == "COPY_TO_DEVICE"
@@ -80,6 +82,7 @@ def test_values_are_normalized_and_read_live(monkeypatch):
     assert envs.MX_S3_MAX_POOL_CONNECTIONS == 6
     assert envs.MX_S3_MAX_ATTEMPTS == 7
     assert envs.MX_S3_TCP_KEEPALIVE is False
+    assert envs.MX_REFIT_STAGED_LAYERS == 2
 
 
 @pytest.mark.parametrize(
@@ -98,6 +101,7 @@ def test_values_are_normalized_and_read_live(monkeypatch):
         "MX_S3_DOWNLOAD_WORKERS",
         "MX_S3_MAX_POOL_CONNECTIONS",
         "MX_S3_MAX_ATTEMPTS",
+        "MX_REFIT_STAGED_LAYERS",
     ],
 )
 def test_positive_integer_settings_reject_zero(monkeypatch, name):

@@ -52,6 +52,24 @@ def _copy_checkpoint_file(source: str, destination: str) -> str:
     return shutil.copy2(source, destination)
 
 
+def _can_clone(directory: Path) -> bool:
+    """Whether a file copied within ``directory`` can share its source's blocks."""
+    if sys.platform != "linux":
+        return False
+    source = directory / ".clone-probe"
+    destination = directory / ".clone-probe.copy"
+    try:
+        source.write_bytes(b"\0")
+        with source.open("rb") as src, destination.open("wb") as dst:
+            fcntl.ioctl(dst.fileno(), getattr(fcntl, "FICLONE", 0x40049409), src.fileno())
+        return True
+    except OSError:
+        return False
+    finally:
+        source.unlink(missing_ok=True)
+        destination.unlink(missing_ok=True)
+
+
 # A prefetcher polls as soon as this file's modification time changes.
 PREFETCH_TRIGGER_FILE = "prefetch.trigger"
 
@@ -68,8 +86,9 @@ def _encode_cache_component(value: str) -> str:
 class CheckpointState(str, Enum):
     """Preparation state persisted across receiver processes.
 
-    ``STAGED`` means the target's delta is verified and staged against its base,
-    whose checkpoint files still hold the base's bytes.
+    ``STAGED`` means the target's delta is verified and staged, while the
+    checkpoint files still hold an earlier version, the record's ``base``. The
+    deltas between them in the target's chain are staged too.
     """
 
     READY = "READY"
@@ -85,7 +104,7 @@ class CheckpointRecord:
     version: str
     files: dict[str, list[int]] | None = None
     source: dict[str, str] | None = None
-    # The version whose bytes the checkpoint files hold, for a STAGED version.
+    # The earlier version whose bytes the checkpoint files hold, when STAGED.
     base: str | None = None
 
     @classmethod
@@ -191,7 +210,8 @@ class LocalCheckpointStore:
         # state.json without changing active.json; installation advances
         # active.json only after the engine reload succeeds. A STAGED version
         # is verified and staged but not yet materialized: the checkpoint
-        # files still hold its base.
+        # files still hold an earlier version, and staging holds every delta
+        # since.
         self.cache = Path(root) / _encode_cache_component(model_name)
         self.full_cache = self.cache / "full"
         self.delta_cache = self.cache / "deltas"
@@ -206,6 +226,7 @@ class LocalCheckpointStore:
         self.prepare_lock_path = self.cache / ".prepare.lock"
         self.install_lock_path = self.cache / ".install.lock"
         self.max_size_bytes = max_size_bytes
+        self._clones: bool | None = None
 
     def initialize(self) -> None:
         self.cache.mkdir(parents=True, exist_ok=True)
@@ -270,6 +291,12 @@ class LocalCheckpointStore:
         except Exception:
             shutil.rmtree(temporary, ignore_errors=True)
             raise
+
+    def clones_files(self) -> bool:
+        """Whether copies in the cache share their source's blocks, as reflinks."""
+        if self._clones is None:
+            self._clones = _can_clone(self.cache)
+        return self._clones
 
     def _version_path(self, root: Path, version: str) -> Path:
         return root / _encode_cache_component(version)

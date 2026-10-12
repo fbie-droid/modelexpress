@@ -17,7 +17,7 @@ import hashlib
 import logging
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import closing, nullcontext
 from dataclasses import dataclass, field, replace
 from functools import cached_property
@@ -625,26 +625,31 @@ def _agree_with_peers(flags: torch.Tensor) -> torch.Tensor:
     return agreed
 
 
-def _with_staged_delta(
-    tensors: Iterable[tuple[str, torch.Tensor]], staging: Path | None
+def _with_staged_deltas(
+    tensors: Iterable[tuple[str, torch.Tensor]], overlay: Sequence[Path]
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Checkpoint tensors from a staged delta's base files, with that delta XORed in."""
-    if staging is None:
+    """Checkpoint tensors from files of an earlier version, with the staged deltas since XORed in."""
+    if not overlay:
         yield from tensors
         return
-    staged = StagedDelta(staging)
+    layers: list[StagedDelta] = []
     try:
+        for staging in overlay:
+            layers.append(StagedDelta(staging))
         for name, tensor in tensors:
-            if name in staged:
-                delta = staged.tensor(name)
+            deltas = [layer.tensor(name) for layer in layers if name in layer]
+            if deltas:
                 tensor = tensor.clone()
                 data = tensor.reshape(-1).view(torch.uint8)
-                if delta.values.size:
-                    positions = torch.from_numpy(delta.positions.astype(np.int64)).to(data.device)
-                    data[positions] ^= torch.from_numpy(np.array(delta.values)).to(data.device)
+                for delta in deltas:
+                    if delta.values.size:
+                        positions = torch.from_numpy(delta.positions.astype(np.int64))
+                        values = torch.from_numpy(np.array(delta.values))
+                        data[positions.to(data.device)] ^= values.to(data.device)
             yield name, tensor
     finally:
-        staged.close()
+        for layer in layers:
+            layer.close()
 
 
 def _tensor_parallel_peers() -> Peers | None:
@@ -805,15 +810,15 @@ class _VllmInstaller(EngineInstaller):
                     if rl_envs.MX_REFIT_DELTA_SURGICAL and inplace is None
                     else None
                 )
-                # A STAGED checkpoint's files still hold its staging base.
-                staged = None if checkpoint.materialized else checkpoint.staging
+                # A STAGED checkpoint's files still hold an earlier version.
+                overlay = checkpoint.overlay
                 if inplace is not None:
                     metrics.update(inplace)
                 elif changed is None:
-                    self.install_checkpoint(checkpoint.path, staged=staged)
+                    self.install_checkpoint(checkpoint.path, overlay=overlay)
                 else:
                     metrics.update(
-                        self.install_changed_tensors(checkpoint.path, changed, staged=staged)
+                        self.install_changed_tensors(checkpoint.path, changed, overlay=overlay)
                     )
             self._live_version = checkpoint.target_version
         else:
@@ -1310,11 +1315,11 @@ class _VllmInstaller(EngineInstaller):
                         _keep_storage(name, old, new)
                         vars(layer)[name] = old
 
-    def install_checkpoint(self, path: str | Path, *, staged: Path | None = None) -> None:
+    def install_checkpoint(self, path: str | Path, *, overlay: Sequence[Path] = ()) -> None:
         """Reload a prepared safetensors checkpoint into the live model.
 
-        With ``staged``, ``path`` holds the staged delta's base, which the delta
-        turns into the target as tensors are read.
+        With ``overlay``, ``path`` holds an earlier version, which those staged
+        deltas turn into the target as tensors are read.
         """
         try:
             from vllm.model_executor.model_loader.default_loader import (
@@ -1334,10 +1339,10 @@ class _VllmInstaller(EngineInstaller):
         model_config.model = str(path)
         model_config.revision = None
         loader = DefaultModelLoader(load_config)
-        if staged is not None:
+        if overlay:
             weights = loader.get_all_weights
-            loader.get_all_weights = lambda config, model: _with_staged_delta(
-                weights(config, model), staged
+            loader.get_all_weights = lambda config, model: _with_staged_deltas(
+                weights(config, model), overlay
             )
 
         self._reload(lambda _aliases: loader.load_weights(self._model, model_config))
@@ -1351,7 +1356,7 @@ class _VllmInstaller(EngineInstaller):
         path: str | Path,
         changed: frozenset[str],
         *,
-        staged: Path | None = None,
+        overlay: Sequence[Path] = (),
     ) -> dict[str, float]:
         """Reload only the modules whose checkpoint tensors a delta changed.
 
@@ -1386,7 +1391,7 @@ class _VllmInstaller(EngineInstaller):
 
         def load(_aliases: _ParameterAliases) -> None:
             nonlocal fallback
-            self._model.load_weights(_with_staged_delta(subset(), staged))
+            self._model.load_weights(_with_staged_deltas(subset(), overlay))
             incomplete = [
                 type(layer).__name__
                 for layer, info in LAYERWISE_INFO.items()
@@ -1412,8 +1417,8 @@ class _VllmInstaller(EngineInstaller):
                 model_config, self._model
             )
             self._model.load_weights(
-                _with_staged_delta(
-                    ((name, tensor) for name, tensor in rest if name not in names), staged
+                _with_staged_deltas(
+                    ((name, tensor) for name, tensor in rest if name not in names), overlay
                 )
             )
 

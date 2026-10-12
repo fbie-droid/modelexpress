@@ -31,7 +31,7 @@ from modelexpress_rl import (
 from modelexpress_rl.inference import client as client_module
 from modelexpress_rl.inference import prefetch as prefetch_module
 from modelexpress_rl.inference import receiver as receiver_module
-from modelexpress_rl.inference.checkpoint_store import CheckpointState
+from modelexpress_rl.inference.checkpoint_store import CheckpointState, LocalCheckpointStore
 from modelexpress_rl.inference.client import ModelExpressGeneratorClient
 from modelexpress_rl.inference.methods import CanonicalDeltaUpdateMethod
 from modelexpress_rl.inference.session import WeightUpdateSession
@@ -466,6 +466,7 @@ def _head_weight(checkpoint):
 
 def test_staged_prefetch_rewrites_the_head_once_the_engine_serves_it(monkeypatch, tmp_path):
     monkeypatch.setenv("MX_REFIT_INPLACE", "true")
+    monkeypatch.setattr(LocalCheckpointStore, "clones_files", lambda self: True)
     objects = _delta_snapshot(
         [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
     )
@@ -523,11 +524,11 @@ def test_a_rewrite_checks_for_a_delta_on_top_of_the_head(monkeypatch, tmp_path):
     version, speculative = prefetcher._following(head)()
     assert (version.version_id, speculative) == ("v2", False)
 
-    # A registered delta on the staged head joins its rewrite in one pass.
+    # A registered delta on the staged head is checked through its staged delta.
     assert prefetcher.poll_once() == "v2"
     state = checkpoint.store.state()
-    assert (state.status, state.version, state.base) == (CheckpointState.STAGED, "v2", "v1")
-    assert _head_weight(checkpoint) == [1.0, 3.0]
+    assert (state.status, state.version, state.base) == (CheckpointState.STAGED, "v2", "base")
+    assert _head_weight(checkpoint) == [1.0, 2.0]
     status = json.loads((checkpoint.store.cache / prefetch_module.STATUS_FILE).read_text())
     assert (status["kind"], status["version"], status["uri"]) == (
         "registered",
@@ -536,8 +537,13 @@ def test_a_rewrite_checks_for_a_delta_on_top_of_the_head(monkeypatch, tmp_path):
     )
 
 
-def test_a_rewrite_reports_the_delta_it_joined(monkeypatch, tmp_path):
+@pytest.mark.parametrize("layers,files", [("1", "v1"), ("4", "base")])
+def test_a_rewrite_reports_the_delta_it_prepared(monkeypatch, tmp_path, layers, files):
+    # One staged delta is the limit, so the rewrite is in place and the
+    # delta joins it; below the limit, the delta abandons a copy instead.
     monkeypatch.setenv("MX_REFIT_INPLACE", "true")
+    monkeypatch.setenv("MX_REFIT_STAGED_LAYERS", layers)
+    monkeypatch.setattr(LocalCheckpointStore, "clones_files", lambda self: True)
     monkeypatch.setattr(prefetch_module, "_WANTED_CHECK_SECONDS", 0.0)
     objects = {
         **_delta_snapshot(
@@ -562,12 +568,36 @@ def test_a_rewrite_reports_the_delta_it_joined(monkeypatch, tmp_path):
     )
 
     assert prefetcher.poll_once() == "v2"
+    assert checkpoint.store.state().base == files
     status = json.loads((checkpoint.store.cache / prefetch_module.STATUS_FILE).read_text())
     assert (status["kind"], status["version"], status["uri"]) == (
         "rewrite",
         "v2",
         _uri("run-v000002"),
     )
+
+
+def test_a_head_left_staged_by_its_rewrite_is_not_retried(monkeypatch, tmp_path):
+    monkeypatch.setenv("MX_REFIT_INPLACE", "true")
+    monkeypatch.setattr(LocalCheckpointStore, "clones_files", lambda self: False)
+    objects = _delta_snapshot(
+        [1.0, 2.0], [1.0, 3.0], identity="run-v000001", base_identity="run-v000000"
+    )
+    _s3, checkpoint, refit, prefetcher = _setup(tmp_path, objects, staged=True)
+    refit.add("v1", payload=XOR, base="base", uri=_uri("run-v000001"), created=2)
+    prefetcher.poll_once()
+    checkpoint.store.activate("v1")
+    calls = []
+    materialize = checkpoint.materialize_head
+    monkeypatch.setattr(
+        checkpoint, "materialize_head", lambda **kwargs: calls.append(1) or materialize(**kwargs)
+    )
+
+    # Without a copy that shares the files' blocks, nothing is written below the limit.
+    assert prefetcher.poll_once() is None
+    assert prefetcher.poll_once() is None
+    assert len(calls) == 1
+    assert checkpoint.store.state().status is CheckpointState.STAGED
 
 
 def test_an_engine_announces_the_target_it_waits_to_prepare(monkeypatch, tmp_path):

@@ -140,6 +140,9 @@ class RefitPrefetcher:
         # Servers that predate version listing still support the S3 watch.
         self._registry_listing = True
         self._writer_versions: dict[str, str] = {}
+        # The STAGED head and files a rewrite last tried, which stay unwritten
+        # when it found no room or failed.
+        self._rewrite_tried: tuple[str, str | None] | None = None
 
     @classmethod
     def connect(cls, settings: PrefetchSettings) -> RefitPrefetcher:
@@ -192,9 +195,11 @@ class RefitPrefetcher:
         if (
             state.status is CheckpointState.STAGED
             and _active_version(self._store) == state.version
+            and self._rewrite_tried != (state.version, state.base)
         ):
             # The engine serves the staged head, so write it into the files
-            # now. A delta that appears meanwhile joins the same pass.
+            # now. A delta that appears meanwhile stops or joins the rewrite.
+            self._rewrite_tried = (state.version, state.base)
             return self._prepare(
                 state.version,
                 kind="rewrite",
