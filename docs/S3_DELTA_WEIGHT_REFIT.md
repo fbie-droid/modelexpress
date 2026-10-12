@@ -729,8 +729,10 @@ flowchart LR
 - Checkpoint headers are parsed once per process. Deltas never change them, so
   each update reuses the previous index. `perf/mx_receive_inplace_index_time`,
   `perf/mx_receive_inplace_plan_time`, `perf/mx_receive_inplace_expert_time`, and
-  `perf/mx_receive_inplace_generic_time` split the install, and
-  `perf/mx_receive_inplace_direct_tensors` counts the tensors XORed directly.
+  `perf/mx_receive_inplace_generic_time` split the install, with
+  `perf/mx_receive_inplace_input_time` the part of the last spent building the
+  reload's inputs. `perf/mx_receive_inplace_direct_tensors` counts the tensors
+  XORed directly.
 - After the engine starts, it holds `initial_serving_version_id` when the
   orchestrator passes one, and otherwise `initial_base_version_id`. The first
   delta from that version installs in place, or surgically, without a full

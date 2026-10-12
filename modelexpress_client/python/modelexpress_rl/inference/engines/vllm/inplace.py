@@ -586,6 +586,8 @@ class InPlaceInstaller:
         # Processed zeros per expert layout; None when processing maps zero to zero.
         self._zero_terms: dict[tuple, dict[str, torch.Tensor] | None] = {}
         self._catalog: tuple[dict[str, dict], CheckpointCatalog] | None = None
+        # Time spent building the reload's inputs in the current install.
+        self._input_seconds = 0.0
 
     def install(self, checkpoint: str | Path, staging: Path) -> dict[str, float]:
         started = time.perf_counter()
@@ -632,6 +634,7 @@ class InPlaceInstaller:
         expert_seconds = time.perf_counter() - expert_started
 
         generic_started = time.perf_counter()
+        self._input_seconds = 0.0
         fed, direct = self._install_generic(staged, changed, catalog, metadata, plan)
         _synchronize(self._device)
         return {
@@ -640,6 +643,7 @@ class InPlaceInstaller:
             "perf/mx_receive_inplace_expert_layers": float(len(expert_layers)),
             "perf/mx_receive_inplace_expert_time": expert_seconds,
             "perf/mx_receive_inplace_generic_tensors": float(fed),
+            "perf/mx_receive_inplace_input_time": self._input_seconds,
             "perf/mx_receive_inplace_direct_tensors": float(direct),
             "perf/mx_receive_inplace_verified_tensors": float(len(self._verified)),
             "perf/mx_receive_inplace_generic_time": time.perf_counter() - generic_started,
@@ -748,11 +752,17 @@ class InPlaceInstaller:
         # They then hold the loaded value rather than an XOR of it.
         originals = {name: tensor.detach().clone() for name, tensor in live.items()}
 
+        device = self._input_device(max(metadata[name]["byte_size"] for name in fed))
+        input_seconds = 0.0
+
         def tensors(zero: bool) -> Iterator[tuple[str, torch.Tensor]]:
+            nonlocal input_seconds
             for name in fed:
                 info = metadata[name]
+                started = time.perf_counter()
                 delta = None if zero or name not in staged_names else staged.tensor(name)
-                data = staged_bytes(info["byte_size"], delta, self._input_device(info["byte_size"]))
+                data = staged_bytes(info["byte_size"], delta, device)
+                input_seconds += time.perf_counter() - started
                 yield name, data.view(_TORCH_DTYPES[info["dtype"]]).view(info["shape"])
 
         self._generic_reload(lambda _aliases: self._model.load_weights(tensors(zero=True)))
@@ -767,6 +777,7 @@ class InPlaceInstaller:
         self._generic_reload(lambda _aliases: self._model.load_weights(tensors(zero=False)))
         for name, original in changed_live.items():
             xor_into(live[name].data, original)
+        self._input_seconds = input_seconds
         if self._direct_enabled:
             with torch.no_grad():
                 self._verify(staged, changed, groups, catalog, metadata, plan, live, originals)
@@ -984,9 +995,10 @@ class InPlaceInstaller:
         return found
 
     def _input_device(self, nbytes: int) -> torch.device:
-        """Build a reload input on the GPU when it has room to spare, else on the host.
+        """Build reload inputs on the GPU when it has room for a few of the largest.
 
         Host inputs cost page faults and a host-to-device copy of every byte.
+        Asked once per reload, since querying free memory can be slow.
         """
         if self._device.type != "cuda":
             return torch.device("cpu")
