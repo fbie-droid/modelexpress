@@ -239,7 +239,18 @@ class LocalCheckpointStore:
         ):
             path.mkdir(exist_ok=True)
 
-        with self.locked(shared=True):
+        with self.locked():
+            # Writers fill <artifact>.tmp while they hold this lock, so one
+            # found here was left by a process that stopped mid-write.
+            for root in (
+                self.full_cache,
+                self.delta_cache,
+                self.materialized_cache,
+                self.staging_cache,
+            ):
+                for temporary in root.glob("*.tmp"):
+                    logger.info("Removing interrupted checkpoint write %s", temporary)
+                    shutil.rmtree(temporary, ignore_errors=True)
             free_bytes = shutil.disk_usage(self.cache).free
             disk_limit = self.cache_size_bytes() + free_bytes
             if self.max_size_bytes is None or self.max_size_bytes > disk_limit:
@@ -275,7 +286,11 @@ class LocalCheckpointStore:
         *,
         copy_from: Path | None = None,
     ) -> Iterator[Path]:
-        """Populate a temporary directory and promote it to ``target``."""
+        """Populate a temporary directory and promote it to ``target``.
+
+        Callers hold the exclusive cache lock, so initialization can remove a
+        temporary directory that a stopped process left.
+        """
         temporary = target.with_name(f"{target.name}.tmp")
         shutil.rmtree(temporary, ignore_errors=True)
         try:

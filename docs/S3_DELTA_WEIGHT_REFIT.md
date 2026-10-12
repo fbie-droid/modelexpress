@@ -257,7 +257,9 @@ Explicit external seed paths remain the source of their non-weight files.
 This is the root of ModelExpress's host-local immutable checkpoint cache. During
 initialization, ModelExpress creates a model-specific subdirectory containing
 full checkpoints, delta payloads, resolved chains, derived materializations,
-and activation state.
+and activation state. Each artifact directory is written as `<version>.tmp` and
+renamed into place once complete; initialization removes any `.tmp` directory
+that a stopped process left behind.
 
 `full/<version>/` and `deltas/<version>/` contain canonical immutable artifacts.
 `chains/<version>.json` resolves a version to one full checkpoint plus its
@@ -809,7 +811,8 @@ stateDiagram-v2
   needs the target's own files, writes the staged deltas into the files first.
 - While files are rewritten in place, the head is `UPDATING`, so a crash makes
   the next initialization rebuild it from its lineage. A crash during a rewrite
-  into a copy leaves the head `STAGED`.
+  into a copy leaves the head `STAGED`, and the next initialization removes the
+  partial copy.
 - `perf/mx_receive_delta_apply` is the time of the checking pass,
   `perf/mx_receive_staged_layers` the number of deltas staged after it, and
   `perf/mx_receive_delta_rewrite` the time spent writing staged deltas into the

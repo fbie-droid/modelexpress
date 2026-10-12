@@ -243,6 +243,25 @@ def test_store_directory_replacement_rolls_back_on_failure(tmp_path):
     assert not target.with_name("v1.tmp").exists()
 
 
+@pytest.mark.parametrize(
+    "path_for", ["full_path", "delta_path", "materialized_path", "staging_path"]
+)
+def test_store_initialization_removes_interrupted_replacements(tmp_path, path_for):
+    store = LocalCheckpointStore(root=tmp_path, model_name="test/model")
+    store.initialize()
+    kept = getattr(store, path_for)("v1")
+    kept.mkdir()
+    (kept / "weights").write_bytes(b"kept")
+    # A process that stops while it fills a replacement never promotes it.
+    temporary = store.replace_directory(getattr(store, path_for)("v2")).__enter__()
+    (temporary / "weights").write_bytes(b"partial")
+
+    LocalCheckpointStore(root=tmp_path, model_name="test/model").initialize()
+
+    assert not temporary.exists()
+    assert (kept / "weights").read_bytes() == b"kept"
+
+
 def test_store_rejects_changed_artifacts_and_source_identity(tmp_path):
     store = LocalCheckpointStore(root=tmp_path, model_name="test/model")
     store.initialize()
