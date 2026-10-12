@@ -261,9 +261,13 @@ and activation state.
 `full/<version>/` and `deltas/<version>/` contain canonical immutable artifacts.
 `chains/<version>.json` resolves a version to one full checkpoint plus its
 ordered deltas. The first delta after a full checkpoint copies that immutable
-full checkpoint into `materialized/<version>/`. Later sequential deltas rename
-the active derived checkpoint and apply only the incoming delta in place, so
-they do not copy the full model. Current vLLM and SGLang installers consume that
+full checkpoint into `materialized/<version>/`, as a reflink clone where the
+filesystem supports it. Later sequential deltas rename the active derived
+checkpoint and apply only the incoming delta in place, so they do not copy the
+full model. A delta applies in 16 MiB chunks that are read from the checkpoint
+file, XORed, checksummed, and written back; a tensor larger than 256 MiB spreads
+its chunks over the `MX_REFIT_DELTA_WORKERS` threads. Current vLLM and SGLang
+installers consume that
 ordinary checkpoint directory. Materializations are derived and can be rebuilt
 from the canonical lineage. If an in-place delta fails, the running engine keeps
 its previous weights, the cache remains `UPDATING`, and initialization rebuilds
