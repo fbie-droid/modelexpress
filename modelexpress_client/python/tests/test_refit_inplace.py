@@ -337,6 +337,8 @@ def test_staged_runs_split_by_size_and_offset_width(tmp_path):
 
     assert inplace_module.staged_runs(staged, 0, 4, limit=8) == [(0, 2), (2, 3), (3, 4)]
     assert inplace_module.staged_runs(staged, 0, 2, limit=5) == [(0, 1), (1, 2)]
+    # Rows larger than the limit form runs of their own.
+    assert inplace_module.staged_runs(staged, 1, 4, limit=2) == [(1, 2), (2, 3), (3, 4)]
     assert inplace_module.staged_runs(staged, 1, 1) == []
     staged.close()
 

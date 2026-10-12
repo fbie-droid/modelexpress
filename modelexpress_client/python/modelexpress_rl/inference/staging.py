@@ -162,9 +162,9 @@ class StagedDelta:
         """Staged byte counts of rows ``[begin, end)``."""
         return self._counts[begin:end]
 
-    def offset_width(self, row: int) -> int:
-        """Bytes per staged offset of one row."""
-        return int(self._widths[row])
+    def offset_widths(self, begin: int, end: int) -> np.ndarray:
+        """Bytes per staged offset of rows ``[begin, end)``."""
+        return self._widths[begin:end]
 
     def byte_ranges(self, begin: int, end: int) -> tuple[tuple[int, int], tuple[int, int]]:
         """Ranges of rows ``[begin, end)`` in the offsets file and the values file."""

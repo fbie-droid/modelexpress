@@ -189,20 +189,20 @@ def staged_runs(
 ) -> list[tuple[int, int]]:
     """Split rows ``[begin, end)`` into runs of about ``limit`` staged bytes.
 
-    A run never mixes offset widths, so its offsets read as one integer type.
+    A run holds at least one row and never mixes offset widths, so its offsets
+    read as one integer type.
     """
-    runs = []
-    counts = staged.counts(begin, end)
-    start, total = begin, 0
-    for row, count in enumerate(counts.tolist(), begin):
-        if row > start and (
-            total + count > limit or staged.offset_width(row) != staged.offset_width(start)
-        ):
-            runs.append((start, row))
-            start, total = row, 0
-        total += count
-    if end > begin:
-        runs.append((start, end))
+    ends = np.cumsum(staged.counts(begin, end))
+    widths = staged.offset_widths(begin, end)
+    # Rows where the offset width changes, relative to ``begin``, then the end.
+    breaks = np.append(np.flatnonzero(widths[1:] != widths[:-1]) + 1, end - begin)
+    runs, start = [], 0
+    while start < end - begin:
+        before = int(ends[start - 1]) if start else 0
+        stop = max(int(np.searchsorted(ends, before + limit, side="right")), start + 1)
+        stop = min(stop, int(breaks[np.searchsorted(breaks, start, side="right")]))
+        runs.append((begin + start, begin + stop))
+        start = stop
     return runs
 
 
@@ -333,7 +333,8 @@ class StagedRunReader:
         host = self._buffers[slot][:width]
         if self._device.type == "cuda":
             local = host.to(self._device, non_blocking=True)
-            copy = torch.cuda.Event()
+            # Readers sleep on it rather than spin, leaving the CPU to processing.
+            copy = torch.cuda.Event(blocking=True)
             copy.record()
             self._copies[slot] = copy
         else:
@@ -343,7 +344,7 @@ class StagedRunReader:
         positions_bytes, values_bytes = share.run_bytes
         offsets = rows[:, : share.positions_part].reshape(-1)[:positions_bytes]
         values = rows[:, share.positions_part :].reshape(-1)[:values_bytes]
-        if self._staged.offset_width(begin) == 4:
+        if self._staged.offset_widths(begin, end)[0] == 4:
             offsets = offsets.view(torch.int32)
         else:
             offsets = offsets.view(torch.int64)
